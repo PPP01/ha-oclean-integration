@@ -97,3 +97,10 @@ class TestOcleanButtonUnknownKey:
         coord.async_reset_brush_head.assert_not_awaited()
         coord.async_sync_time.assert_not_awaited()
         coord.async_request_refresh.assert_not_awaited()
+
+
+def test_parallel_updates_serialises_ble_actions():
+    """The brush accepts one GATT connection; entity actions must be serialised."""
+    from custom_components.oclean_ble import button as platform_module
+
+    assert platform_module.PARALLEL_UPDATES == 1

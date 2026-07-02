@@ -10,7 +10,7 @@ import logging
 import struct
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import time as _dtime
 from datetime import timedelta
 from typing import Any
@@ -24,10 +24,12 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .ble_utils import is_genuine_cancellation
 from .const import (
     AREA_COVERAGE_NORM_THRESHOLD,
     AREA_COVERAGE_Y3PD_THRESHOLD,
     BATTERY_CHAR_UUID,
+    BLE_ACTION_TOTAL_TIMEOUT,
     BLE_ENRICHMENT_WAIT,
     BLE_NOTIFICATION_WAIT,
     BLE_NOTIFICATION_WAIT_NO_SUB,
@@ -495,14 +497,53 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
     # Public API for button entities
     # ------------------------------------------------------------------
 
-    async def async_reset_brush_head(self) -> None:
-        """Connect to the device and send CMD_CLEAR_BRUSH_HEAD (020F).
+    async def _run_ble_action(
+        self,
+        description: str,
+        action: Callable[[BleakClient], Awaitable[None]],
+    ) -> None:
+        """Run *action* against a freshly connected client, fully protected.
 
-        Subscribes to response characteristics before sending the command so
-        any ACK notification is captured and logged for protocol research.
-        Called by the "Reset Brush Head" button entity.
-        Raises BleakError if the device cannot be reached.
+        Gives the write-action entities (buttons, switches, numbers, selects)
+        the same safeguards the poll path (_poll_device) already has:
+
+        * one total ``asyncio.wait_for`` ceiling over connect + action +
+          disconnect, so a hung GATT operation can never stall an entity
+          action indefinitely,
+        * the spurious ``CancelledError`` leaked by the ESPHome BLE-proxy
+          connect path when a sleeping device times out (its internal
+          disconnect-guard cancels an await) is translated into a
+          ``BleakError`` – a genuine task cancellation (HA shutdown / entry
+          reload, ``current_task().cancelling() > 0``) still propagates,
+        * the client is always disconnected via ``finally``.
+
+        Raises BleakError if the device cannot be reached, matching the
+        documented behaviour of all public write methods.
         """
+        try:
+            await asyncio.wait_for(
+                self._connect_and_run(action),
+                timeout=BLE_ACTION_TOTAL_TIMEOUT,
+            )
+        except asyncio.CancelledError as err:
+            task = asyncio.current_task()
+            if is_genuine_cancellation(task.cancelling() if task is not None else 0):
+                raise
+            self._log.debug(
+                "%s cancelled by BLE proxy (device likely asleep): %s",
+                description,
+                err,
+            )
+            raise BleakError(
+                f"device not reachable (proxy cancelled during {description})"
+            ) from err
+        except TimeoutError as err:
+            raise BleakError(
+                f"{description} timed out after {BLE_ACTION_TOTAL_TIMEOUT}s"
+            ) from err
+
+    async def _connect_and_run(self, action: Callable[[BleakClient], Awaitable[None]]) -> None:
+        """Connect, wait for the GATT table, run *action*, always disconnect."""
         ble_device = self._resolve_ble_device()
         client = await establish_connection(
             BleakClient,
@@ -512,7 +553,21 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         )
         try:
             await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+            await action(client)
+        finally:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
 
+    async def async_reset_brush_head(self) -> None:
+        """Connect to the device and send CMD_CLEAR_BRUSH_HEAD (020F).
+
+        Subscribes to response characteristics before sending the command so
+        any ACK notification is captured and logged for protocol research.
+        Called by the "Reset Brush Head" button entity.
+        Raises BleakError if the device cannot be reached.
+        """
+
+        async def _action(client: BleakClient) -> None:
             def _ack_handler(_sender: Any, raw: bytearray) -> None:
                 data = bytes(raw)
                 parsed = parse_notification(data)
@@ -537,9 +592,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             for char_uuid in subscribed_ack:
                 with contextlib.suppress(Exception):
                     await client.stop_notify(char_uuid)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("reset brush head", _action)
 
         self._brush_head_sw_count = 0
         await self._save_store()
@@ -552,15 +606,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the "Sync Time" button entity.
         Raises BleakError if the device cannot be reached.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             subscribed: list[str] = []
             for char_uuid in self._protocol.notify_chars:
                 try:
@@ -572,9 +619,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             for char_uuid in subscribed:
                 with contextlib.suppress(Exception):
                     await client.stop_notify(char_uuid)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("sync time", _action)
 
     @property
     def area_remind(self) -> bool | None:
@@ -607,21 +653,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the Area Reminder switch entity.  State is persisted so the
         switch shows the correct value after HA restarts.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
         cmd = CMD_AREA_REMIND + bytes([0x01 if enabled else 0x00])
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             await self._write_standalone(client, cmd)
             self._log.info("area remind set to %s", enabled)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("area remind write", _action)
         self._area_remind = enabled
         await self._save_store()
 
@@ -631,21 +669,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the Over-Pressure Alert switch entity.  State is persisted so
         the switch shows the correct value after HA restarts.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
         cmd = CMD_OVER_PRESSURE + bytes([0x01 if enabled else 0x00])
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             await self._write_standalone(client, cmd)
             self._log.info("over pressure set to %s", enabled)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("over pressure write", _action)
         self._over_pressure = enabled
         await self._save_store()
 
@@ -655,21 +685,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the Brushing Reminder switch entity.  State is persisted so
         the switch shows the correct value after HA restarts.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
         cmd = CMD_REMIND_SWITCH + bytes([0x01 if enabled else 0x00])
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             await self._write_standalone(client, cmd)
             self._log.info("remind switch set to %s", enabled)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("remind switch write", _action)
         self._remind_switch = enabled
         await self._save_store()
 
@@ -679,21 +701,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the Auto Power-Off Timer switch entity.  State is persisted so
         the switch shows the correct value after HA restarts.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
         cmd = CMD_RUNNING_SWITCH + bytes([0x01 if enabled else 0x00])
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             await self._write_standalone(client, cmd)
             self._log.info("running switch set to %s", enabled)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("running switch write", _action)
         self._running_switch = enabled
         await self._save_store()
 
@@ -703,21 +717,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the Brush Head Max Lifetime number entity.  State is persisted
         so the number shows the correct value after HA restarts.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
         cmd = CMD_BRUSH_HEAD_MAX_DAYS + days.to_bytes(2, "big")
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             await self._write_standalone(client, cmd)
             self._log.info("brush head max days set to %d", days)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("brush head max days write", _action)
         self._brush_head_max_days = days
         await self._save_store()
 
@@ -743,16 +749,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         name, steps = scheme
         packets = _build_scheme_packets(pnum, steps)
 
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
-
+        async def _action(client: BleakClient) -> None:
             def _ack_handler(_sender: Any, raw: bytearray) -> None:
                 data = bytes(raw)
                 parsed = parse_notification(data)
@@ -788,9 +785,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             for char_uuid in subscribed:
                 with contextlib.suppress(Exception):
                     await client.stop_notify(char_uuid)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("brush scheme write", _action)
         self._active_scheme_pnum = pnum
         await self._save_store()
 

@@ -2864,3 +2864,114 @@ class TestTypeZ1Protocol:
 
         assert client.start_notify.await_count == len(TYPE_Z1.notify_chars)
         assert client.stop_notify.await_count == len(TYPE_Z1.notify_chars)
+
+
+# ---------------------------------------------------------------------------
+# _run_ble_action – shared protection wrapper for all write actions
+# ---------------------------------------------------------------------------
+
+
+class TestWriteActionProtection:
+    """Write actions must share the poll path's safeguards.
+
+    They use the same leaking establish_connection path as the poll, so a
+    sleeping brush must surface as a clean, retryable BleakError – never as a
+    raw CancelledError or an indefinite hang.
+    """
+
+    @pytest.mark.asyncio
+    async def test_spurious_cancel_translated_to_bleak_error(self):
+        """A proxy-leaked CancelledError from establish_connection becomes BleakError."""
+        from bleak import BleakError
+
+        coord = _make_coordinator()
+
+        with (
+            patch("custom_components.oclean_ble.coordinator.bluetooth") as bt_mock,
+            patch(
+                "custom_components.oclean_ble.coordinator.establish_connection",
+                new_callable=AsyncMock,
+                side_effect=asyncio.CancelledError("proxy timeout leak"),
+            ),
+            patch.object(coord, "_save_store", new_callable=AsyncMock),
+        ):
+            bt_mock.async_last_service_info.return_value = _make_service_info()
+            with pytest.raises(BleakError):
+                await coord.async_set_area_remind(True)
+
+        # state must NOT be persisted after a failed write
+        assert coord.area_remind is None
+
+    @pytest.mark.asyncio
+    async def test_genuine_cancellation_propagates(self):
+        """A real task cancel (HA shutdown/reload) must re-raise CancelledError."""
+        coord = _make_coordinator()
+        started = asyncio.Event()
+
+        async def _block(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()  # block forever until cancelled
+
+        with (
+            patch("custom_components.oclean_ble.coordinator.bluetooth") as bt_mock,
+            patch(
+                "custom_components.oclean_ble.coordinator.establish_connection",
+                side_effect=_block,
+            ),
+            patch.object(coord, "_save_store", new_callable=AsyncMock),
+        ):
+            bt_mock.async_last_service_info.return_value = _make_service_info()
+            task = asyncio.get_running_loop().create_task(coord.async_set_area_remind(True))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    @pytest.mark.asyncio
+    async def test_total_timeout_translated_to_bleak_error(self):
+        """A hung connect must be bounded by BLE_ACTION_TOTAL_TIMEOUT → BleakError."""
+        from bleak import BleakError
+
+        coord = _make_coordinator()
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.Event().wait()  # never returns
+
+        with (
+            patch("custom_components.oclean_ble.coordinator.bluetooth") as bt_mock,
+            patch(
+                "custom_components.oclean_ble.coordinator.establish_connection",
+                side_effect=_hang,
+            ),
+            patch("custom_components.oclean_ble.coordinator.BLE_ACTION_TOTAL_TIMEOUT", 0.05),
+            patch.object(coord, "_save_store", new_callable=AsyncMock),
+        ):
+            bt_mock.async_last_service_info.return_value = _make_service_info()
+            with pytest.raises(BleakError):
+                await coord.async_set_area_remind(True)
+
+    @pytest.mark.asyncio
+    async def test_write_failure_still_disconnects(self):
+        """When the GATT write raises, the client must still be disconnected."""
+        from bleak import BleakError
+
+        coord = _make_coordinator()
+        client = _make_bleak_client()
+        client.write_gatt_char.side_effect = BleakError("write failed")
+
+        with (
+            patch("custom_components.oclean_ble.coordinator.bluetooth") as bt_mock,
+            patch(
+                "custom_components.oclean_ble.coordinator.establish_connection",
+                new_callable=AsyncMock,
+                return_value=client,
+            ),
+            patch("custom_components.oclean_ble.coordinator.asyncio.sleep", new_callable=AsyncMock),
+            patch.object(coord, "_save_store", new_callable=AsyncMock),
+        ):
+            bt_mock.async_last_service_info.return_value = _make_service_info()
+            with pytest.raises(BleakError):
+                await coord.async_set_area_remind(True)
+
+        assert client.disconnect.await_count == 1
+        assert coord.area_remind is None

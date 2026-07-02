@@ -120,6 +120,11 @@ BLE_SUBSCRIBE_RETRY_TIMEOUT = 5.0
 # Maximum total time for a single poll (connect → read → disconnect).
 # Prevents a hung GATT operation from blocking HA's event loop indefinitely.
 BLE_POLL_TOTAL_TIMEOUT = 60
+# Maximum total time for a single write action (connect → write → disconnect),
+# e.g. button presses or switch toggles.  Shorter than the poll ceiling because
+# actions transfer only a few bytes; still generous enough for 3 connect
+# attempts through a slow ESPHome proxy plus the post-connect delay.
+BLE_ACTION_TOTAL_TIMEOUT = 45
 # Timeout for a single write_gatt_char() call in the polling path.
 # Guards against BlueZ or ESPHome proxy hangs on individual write operations.
 BLE_WRITE_TIMEOUT = 5.0

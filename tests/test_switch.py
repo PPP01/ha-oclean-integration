@@ -156,3 +156,10 @@ class TestOcleanSwitchUnknownKey:
         desc = SwitchEntityDescription(key="nonexistent")
         switch = OcleanSwitch(coord, desc, "AA:BB:CC:DD:EE:FF", "Oclean")
         await switch.async_turn_off()
+
+
+def test_parallel_updates_serialises_ble_actions():
+    """The brush accepts one GATT connection; entity actions must be serialised."""
+    from custom_components.oclean_ble import switch as platform_module
+
+    assert platform_module.PARALLEL_UPDATES == 1

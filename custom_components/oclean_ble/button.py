@@ -11,6 +11,10 @@ from .const import CONF_DEVICE_NAME, CONF_MAC_ADDRESS, DOMAIN
 from .coordinator import OcleanCoordinator
 from .entity import OcleanEntity
 
+# The toothbrush accepts only ONE GATT connection at a time; serialise entity
+# actions so two concurrent writes cannot race for the single BLE slot.
+PARALLEL_UPDATES = 1
+
 BUTTON_DESCRIPTIONS: tuple[ButtonEntityDescription, ...] = (
     ButtonEntityDescription(
         key="reset_brush_head",
