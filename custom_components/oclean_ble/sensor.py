@@ -11,9 +11,15 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
+from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
-from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    EntityCategory,
+    UnitOfTime,
+)
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -219,6 +225,7 @@ async def async_setup_entry(
     entities.append(OcleanSchemeSensor(coordinator, mac, device_name))
     entities.extend(OcleanToothAreaSensor(coordinator, mac, device_name, zone_name) for zone_name in TOOTH_AREA_NAMES)
     entities.append(OcleanMacSensor(coordinator, mac, device_name))
+    entities.append(OcleanRssiSensor(coordinator, mac, device_name))
     entities.append(OcleanDurationRatingSensor(coordinator, mac, device_name))
     entities.append(OcleanPressureDetailSensor(coordinator, mac, device_name))
     entities.append(OcleanPowerDistributionSensor(coordinator, mac, device_name))
@@ -535,3 +542,75 @@ class OcleanMacSensor(OcleanEntity, SensorEntity):
     @property
     def available(self) -> bool:
         return True
+
+
+class OcleanRssiSensor(OcleanEntity, SensorEntity):
+    """Diagnostic sensor exposing the latest advertisement RSSI (signal strength).
+
+    Read live from Home Assistant's Bluetooth registry (local adapter or ESPHome
+    proxy) rather than from a BLE poll, so the value is available even between
+    polls. Home Assistant already keeps the strongest recent advertisement across
+    all scanners, so the state reflects the best-reachable proxy.
+
+    Updates are event-driven: a passive Bluetooth callback refreshes the entity on
+    every advertisement (no GATT connection, no extra battery cost — the brush
+    broadcasts these anyway) in addition to coordinator updates. Attributes expose
+    the chosen source proxy and the per-proxy RSSI, which is useful for placing a
+    proxy and diagnosing weak-signal issues.
+    """
+
+    _attr_translation_key = "rssi"
+    _attr_icon = "mdi:bluetooth-audio"
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, "rssi")
+
+    async def async_added_to_hass(self) -> None:
+        """Refresh live on every advertisement for this device (passive listen)."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            bluetooth.async_register_callback(
+                self.hass,
+                self._advertisement_callback,
+                bluetooth.BluetoothCallbackMatcher(address=self._mac, connectable=False),
+                bluetooth.BluetoothScanningMode.PASSIVE,
+            )
+        )
+
+    @callback
+    def _advertisement_callback(self, service_info: Any, change: Any) -> None:
+        """Push a fresh state whenever a new advertisement arrives."""
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the strongest recent advertisement RSSI, or None if unknown."""
+        service_info = bluetooth.async_last_service_info(self.hass, self._mac, connectable=False)
+        return service_info.rssi if service_info is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose the chosen source proxy and the RSSI seen by each proxy."""
+        attrs: dict[str, Any] = {}
+        info = bluetooth.async_last_service_info(self.hass, self._mac, connectable=False)
+        if info is not None:
+            attrs["source"] = info.source
+        by_scanner: dict[str, int] = {}
+        for device in bluetooth.async_scanner_devices_by_address(self.hass, self._mac, connectable=False):
+            adv = device.advertisement
+            if adv is None or adv.rssi is None:
+                continue
+            name = getattr(device.scanner, "name", None) or getattr(device.scanner, "source", "?")
+            by_scanner[name] = adv.rssi
+        if by_scanner:
+            attrs["by_scanner"] = by_scanner
+        return attrs or None
+
+    @property
+    def available(self) -> bool:
+        """Available whenever an advertisement has been seen for this MAC."""
+        return bluetooth.async_last_service_info(self.hass, self._mac, connectable=False) is not None
