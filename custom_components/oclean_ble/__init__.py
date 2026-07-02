@@ -50,7 +50,11 @@ def _build_file_handler(log_path: pathlib.Path) -> logging.handlers.RotatingFile
         backupCount=2,  # keep oclean_ble.log + .1 + .2
         encoding="utf-8",
     )
-    handler.setLevel(logging.DEBUG)
+    # No handler-level filter: the integration logger's effective level (set
+    # via HA's `logger:` config or the UI debug toggle) decides what is
+    # written.  The handler is only attached at all when debug logging is
+    # enabled for this integration – see _attach_file_handler().
+    handler.setLevel(logging.NOTSET)
     handler.setFormatter(
         logging.Formatter(
             fmt="%(asctime)s  %(levelname)-8s  [%(name)s]  %(message)s",
@@ -65,7 +69,12 @@ async def _attach_file_handler(hass: HomeAssistant) -> None:
 
     Log file: <config_dir>/oclean_ble.log
     Max size:  1 MB, 2 rotated backups (≤ 3 MB total)
-    Level:     DEBUG – all unknown-byte traces and raw hex dumps included.
+
+    Opt-in: the file is only written while debug logging is enabled for this
+    integration (``logger:`` YAML config or the UI "enable debug logging"
+    toggle, followed by an integration reload).  Without debug enabled no file
+    handler is attached and no log file is created, so raw hex payloads and
+    session data never end up on disk (or in backups) by default.
 
     The handler is shared across multiple config entries (multiple devices).
     It is removed when the last entry is unloaded.
@@ -73,6 +82,13 @@ async def _attach_file_handler(hass: HomeAssistant) -> None:
     domain_data = hass.data.setdefault(DOMAIN, {})
     if _FILE_HANDLER_KEY in domain_data:
         return  # already attached (or attachment in progress)
+
+    oclean_logger = logging.getLogger("custom_components.oclean_ble")
+    if not oclean_logger.isEnabledFor(logging.DEBUG):
+        # Debug logging not enabled for this integration – skip the file log.
+        # Deliberately no sentinel here: a later reload with debug enabled
+        # must be able to attach the handler.
+        return
 
     # Set sentinel *before* the async gap so that a second config entry being
     # set up concurrently also sees the key and skips duplicate attachment.
@@ -82,7 +98,6 @@ async def _attach_file_handler(hass: HomeAssistant) -> None:
     # open() is blocking – run in the default executor to avoid loop warnings
     handler = await hass.async_add_executor_job(_build_file_handler, log_path)
 
-    oclean_logger = logging.getLogger("custom_components.oclean_ble")
     oclean_logger.addHandler(handler)
     domain_data[_FILE_HANDLER_KEY] = handler
     _LOGGER.info("Oclean log file: %s", log_path)

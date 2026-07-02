@@ -85,11 +85,14 @@ class TestBuildFileHandler:
             handler.close()
             log_path.unlink(missing_ok=True)
 
-    def test_level_is_debug(self):
+    def test_level_is_notset(self):
+        # No handler-level filter: the integration logger's effective level
+        # decides what is written (the handler is only attached when debug
+        # logging is enabled for the integration).
         log_path = pathlib.Path(_TMPDIR) / "oclean_test_level.log"
         handler = _build_file_handler(log_path)
         try:
-            assert handler.level == logging.DEBUG
+            assert handler.level == logging.NOTSET
         finally:
             handler.close()
             log_path.unlink(missing_ok=True)
@@ -109,47 +112,99 @@ class TestBuildFileHandler:
 # ---------------------------------------------------------------------------
 
 
+class _debug_enabled:
+    """Temporarily enable DEBUG on the integration logger (restored on exit)."""
+
+    def __enter__(self):
+        self._logger = logging.getLogger("custom_components.oclean_ble")
+        self._old_level = self._logger.level
+        self._logger.setLevel(logging.DEBUG)
+        return self._logger
+
+    def __exit__(self, *exc_info):
+        self._logger.setLevel(self._old_level)
+
+
+class _debug_disabled:
+    """Temporarily force the integration logger above DEBUG (restored on exit)."""
+
+    def __enter__(self):
+        self._logger = logging.getLogger("custom_components.oclean_ble")
+        self._old_level = self._logger.level
+        self._logger.setLevel(logging.INFO)
+        return self._logger
+
+    def __exit__(self, *exc_info):
+        self._logger.setLevel(self._old_level)
+
+
 class TestAttachFileHandler:
     def test_attaches_handler_to_logger(self):
         hass = _make_hass()
-        asyncio.run(_attach_file_handler(hass))
-        handler = hass.data[DOMAIN][_FILE_HANDLER_KEY]
-        assert handler is not None
-        assert isinstance(handler, logging.handlers.RotatingFileHandler)
-        oclean_logger = logging.getLogger("custom_components.oclean_ble")
-        assert handler in oclean_logger.handlers
-        oclean_logger.removeHandler(handler)
-        handler.close()
+        with _debug_enabled() as oclean_logger:
+            asyncio.run(_attach_file_handler(hass))
+            handler = hass.data[DOMAIN][_FILE_HANDLER_KEY]
+            assert handler is not None
+            assert isinstance(handler, logging.handlers.RotatingFileHandler)
+            assert handler in oclean_logger.handlers
+            oclean_logger.removeHandler(handler)
+            handler.close()
 
     def test_idempotent_second_call_no_op(self):
         hass = _make_hass()
-        asyncio.run(_attach_file_handler(hass))
-        first_handler = hass.data[DOMAIN][_FILE_HANDLER_KEY]
-        asyncio.run(_attach_file_handler(hass))
-        assert hass.data[DOMAIN][_FILE_HANDLER_KEY] is first_handler
-        oclean_logger = logging.getLogger("custom_components.oclean_ble")
-        count = sum(1 for h in oclean_logger.handlers if h is first_handler)
-        assert count == 1
-        oclean_logger.removeHandler(first_handler)
-        first_handler.close()
+        with _debug_enabled() as oclean_logger:
+            asyncio.run(_attach_file_handler(hass))
+            first_handler = hass.data[DOMAIN][_FILE_HANDLER_KEY]
+            asyncio.run(_attach_file_handler(hass))
+            assert hass.data[DOMAIN][_FILE_HANDLER_KEY] is first_handler
+            count = sum(1 for h in oclean_logger.handlers if h is first_handler)
+            assert count == 1
+            oclean_logger.removeHandler(first_handler)
+            first_handler.close()
 
     def test_sentinel_prevents_concurrent_attach(self):
         hass = _make_hass()
         hass.data.setdefault(DOMAIN, {})[_FILE_HANDLER_KEY] = None
-        asyncio.run(_attach_file_handler(hass))
+        with _debug_enabled():
+            asyncio.run(_attach_file_handler(hass))
         assert hass.data[DOMAIN][_FILE_HANDLER_KEY] is None
+
+    # --- Opt-in behaviour: no debug → no file log ---
+
+    def test_skips_attach_when_debug_disabled(self):
+        hass = _make_hass()
+        with _debug_disabled() as oclean_logger:
+            handlers_before = list(oclean_logger.handlers)
+            asyncio.run(_attach_file_handler(hass))
+            assert _FILE_HANDLER_KEY not in hass.data.get(DOMAIN, {})
+            assert oclean_logger.handlers == handlers_before
+
+    def test_attach_works_after_enabling_debug(self):
+        # A skipped attach must not poison the sentinel: enabling debug and
+        # reloading (= calling attach again) must attach the handler.
+        hass = _make_hass()
+        with _debug_disabled():
+            asyncio.run(_attach_file_handler(hass))
+        assert _FILE_HANDLER_KEY not in hass.data.get(DOMAIN, {})
+        with _debug_enabled() as oclean_logger:
+            asyncio.run(_attach_file_handler(hass))
+            handler = hass.data[DOMAIN][_FILE_HANDLER_KEY]
+            assert handler is not None
+            assert handler in oclean_logger.handlers
+            oclean_logger.removeHandler(handler)
+            handler.close()
 
 
 class TestDetachFileHandler:
     def test_removes_handler_and_closes(self):
         hass = _make_hass()
-        asyncio.run(_attach_file_handler(hass))
-        handler = hass.data[DOMAIN][_FILE_HANDLER_KEY]
-        oclean_logger = logging.getLogger("custom_components.oclean_ble")
-        assert handler in oclean_logger.handlers
-        asyncio.run(_detach_file_handler(hass))
-        assert _FILE_HANDLER_KEY not in hass.data.get(DOMAIN, {})
-        assert handler not in oclean_logger.handlers
+        with _debug_enabled() as oclean_logger:
+            asyncio.run(_attach_file_handler(hass))
+            handler = hass.data[DOMAIN][_FILE_HANDLER_KEY]
+            assert handler in oclean_logger.handlers
+            asyncio.run(_detach_file_handler(hass))
+            assert _FILE_HANDLER_KEY not in hass.data.get(DOMAIN, {})
+            assert handler not in oclean_logger.handlers
 
     def test_no_op_when_no_handler(self):
         hass = _make_hass()
