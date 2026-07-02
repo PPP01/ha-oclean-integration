@@ -374,6 +374,33 @@ class TestMapJsonBrushData:
         assert result["last_brush_score"] == 72
         assert isinstance(result["last_brush_score"], int)
 
+    # --- Malformed values must be skipped, never raise (regression) ---
+
+    def test_non_numeric_string_skipped(self):
+        result = _map_json_brush_data({"score": "err"})
+        assert result == {}
+
+    def test_none_value_skipped(self):
+        # JSON null in an int-cast field: int(None) raises TypeError
+        result = _map_json_brush_data({"pressure": None})
+        assert result == {}
+
+    def test_list_value_skipped(self):
+        result = _map_json_brush_data({"score": [1, 2, 3]})
+        assert result == {}
+
+    def test_bad_field_does_not_drop_valid_fields(self):
+        result = _map_json_brush_data({"score": "err", "duration": 120})
+        assert result == {"last_brush_duration": 120}
+
+    def test_parse_notification_json_bad_value_does_not_raise(self):
+        # End-to-end via the real entry point: a device (or proxy) sending
+        # valid JSON with a non-numeric field must not raise out of
+        # parse_notification() and abort the coordinator poll.
+        payload = json.dumps({"score": "err", "duration": 120}).encode()
+        result = parse_notification(payload)
+        assert result == {"last_brush_duration": 120}
+
 
 # ---------------------------------------------------------------------------
 # _parse_running_data_record  (new binary parser from C3340b1.m5348m1)
