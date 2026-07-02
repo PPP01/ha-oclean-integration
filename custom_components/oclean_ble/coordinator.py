@@ -90,6 +90,7 @@ from .parser import (
     parse_t1_c3385w0_record,
     parse_y3p_stream_record,
 )
+from .program_utils import validate_program_steps
 from .protocol import UNKNOWN, DeviceProtocol, is_known_model, protocol_for_model
 from .statistics import import_new_sessions
 
@@ -475,6 +476,23 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         try:
             raw = await self._poll_device()
             return OcleanDeviceData.from_dict(raw)
+        except asyncio.CancelledError as err:
+            # The ESPHome BLE-proxy connect path leaks a *spurious* CancelledError
+            # when a connection to a sleeping device times out (its internal
+            # disconnect-guard cancels an await). CancelledError is a
+            # BaseException, so the `except Exception` below never catches it and
+            # it would otherwise abort async_setup_entry ("config entry cancelled").
+            # A *genuine* task cancellation (HA shutdown / entry reload) sets
+            # current_task().cancelling() > 0 and MUST propagate – only translate
+            # the spurious proxy cancellation into a retryable UpdateFailed.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            self._log.debug("poll cancelled by BLE proxy (device likely asleep): %s", err)
+            self.last_poll_successful = False
+            if self._last_raw:
+                return OcleanDeviceData.from_dict(self._last_raw)
+            raise UpdateFailed(f"Oclean device not reachable (proxy cancelled): {err}") from err
         except Exception as err:
             # Catch all exceptions (BleakError, TimeoutError, IndexError from
             # habluetooth proxy backend, etc.) so HA can keep retrying rather
@@ -727,12 +745,10 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         return self._active_scheme_pnum
 
     async def async_set_brush_scheme(self, pnum: int) -> None:
-        """Connect and send the SetBrushScheme command (0206) to the device.
+        """Connect and send a preset SetBrushScheme command (0206) to the device.
 
-        Builds the BLE packet following APK AbstractC0002b.m28p() and sends it
-        via the device's write characteristic.  For schemes with more than 4 steps
-        the payload exceeds 20 bytes and is split into two GATT writes.
-        Called by the Brush Scheme select entity.
+        Looks up the preset steps for *pnum* from the model's scheme dict and
+        writes them.  Called by the Brush Scheme select entity.
         Raises ValueError for unknown pnums, BleakError on connection failure.
         """
         model_id = self.data.model_id if self.data else None
@@ -741,6 +757,28 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         if scheme is None:
             raise ValueError(f"Unknown scheme pnum {pnum} for model {model_id}")
         name, steps = scheme
+        await self._async_write_scheme(pnum, name, steps)
+
+    async def async_set_custom_scheme(self, pnum: int, steps: list[tuple[int, int]]) -> None:
+        """Send a user-defined brush scheme (arbitrary pnum + step list).
+
+        Unlike async_set_brush_scheme this does NOT require *pnum* to exist in a
+        preset dict — it writes whatever (gear, duration) steps are given, which
+        is what enables custom programmes.  Validates ranges and the 1-9 step
+        ceiling.  Raises ValueError on invalid input, BleakError on connection
+        failure.
+        """
+        validate_program_steps(steps)
+        await self._async_write_scheme(pnum, f"custom-{pnum}", steps)
+
+    async def _async_write_scheme(self, pnum: int, name: str, steps: list[tuple[int, int]]) -> None:
+        """Build the 0206 SetBrushScheme packet(s) for *steps* and write them.
+
+        Follows APK AbstractC0002b.m28p(); payloads over 20 bytes are split into
+        two GATT writes.  Subscribes to the notify chars first so any ACK is
+        logged, and waits briefly after the write so the device commits the
+        command before the connection drops.
+        """
         packets = _build_scheme_packets(pnum, steps)
 
         ble_device = self._resolve_ble_device()

@@ -8,10 +8,12 @@ import logging.handlers
 import pathlib
 
 import voluptuous as vol
+from bleak import BleakError
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.const import __version__ as HA_VERSION
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from .const import (
     CONF_DEVICE_NAME,
@@ -22,9 +24,13 @@ from .const import (
     DEFAULT_POLL_INTERVAL,
     DEFAULT_POST_BRUSH_COOLDOWN,
     DOMAIN,
+    SERVICE_DELETE_CUSTOM_PROGRAM,
     SERVICE_POLL,
+    SERVICE_SAVE_CUSTOM_PROGRAM,
+    SERVICE_SET_CUSTOM_SCHEME,
 )
 from .coordinator import OcleanCoordinator
+from .programs import CustomProgramStore
 
 _LOGGER = logging.getLogger(__name__)
 _MANIFEST = json.loads((pathlib.Path(__file__).parent / "manifest.json").read_text())
@@ -144,6 +150,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # successful poll.
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
+    # Global, cross-device custom-programme store (one per HA, shared by all
+    # entries). Created + loaded on the first entry's setup.
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    if "_programs" not in domain_data:
+        program_store = CustomProgramStore(hass)
+        await program_store.async_load()
+        domain_data["_programs"] = program_store
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Listen for option updates (e.g. changed poll interval)
@@ -172,10 +186,101 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=vol.Schema({vol.Optional("entry_id"): str}),
         )
 
-    # Initial poll: best-effort.  If the device is sleeping, entities stay
-    # unavailable and will update as soon as the next poll succeeds (either on
-    # the configured interval or via a manual service call).
-    await coordinator.async_refresh()
+        async def _handle_set_custom_scheme(call: ServiceCall) -> None:
+            """Write a user-defined brush scheme (arbitrary pnum + steps)."""
+            entry_id: str = call.data["entry_id"]
+            pnum: int = call.data["pnum"]
+            steps: list[tuple[int, int]] = [(s["gear"], s["duration"]) for s in call.data["steps"]]
+            coordinator = hass.data.get(DOMAIN, {}).get(entry_id)
+            if not isinstance(coordinator, OcleanCoordinator):
+                raise ServiceValidationError(f"No Oclean device for entry_id {entry_id!r}")
+            try:
+                await coordinator.async_set_custom_scheme(pnum, steps)
+            except ValueError as err:
+                raise ServiceValidationError(str(err)) from err
+            except BleakError as err:
+                raise HomeAssistantError(f"Oclean device not reachable: {err}") from err
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SET_CUSTOM_SCHEME,
+            _handle_set_custom_scheme,
+            schema=vol.Schema(
+                {
+                    vol.Required("entry_id"): str,
+                    vol.Required("pnum"): vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
+                    vol.Required("steps"): [
+                        vol.Schema(
+                            {
+                                vol.Required("gear"): vol.All(vol.Coerce(int), vol.Range(min=1, max=41)),
+                                vol.Required("duration"): vol.All(vol.Coerce(int), vol.Range(min=1, max=255)),
+                            }
+                        )
+                    ],
+                }
+            ),
+        )
+
+        async def _handle_save_custom_program(call: ServiceCall) -> dict[str, int]:
+            """Create/overwrite a global custom programme; return its pnum."""
+            store: CustomProgramStore = hass.data[DOMAIN]["_programs"]
+            name: str = call.data["name"]
+            steps: list[tuple[int, int]] = [(s["gear"], s["duration"]) for s in call.data["steps"]]
+            pnum: int | None = call.data.get("pnum")
+            try:
+                assigned = await store.async_save(name, steps, pnum)
+            except ValueError as err:
+                raise ServiceValidationError(str(err)) from err
+            return {"pnum": assigned}
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SAVE_CUSTOM_PROGRAM,
+            _handle_save_custom_program,
+            schema=vol.Schema(
+                {
+                    vol.Required("name"): str,
+                    vol.Required("steps"): [
+                        vol.Schema(
+                            {
+                                vol.Required("gear"): vol.All(vol.Coerce(int), vol.Range(min=1, max=41)),
+                                vol.Required("duration"): vol.All(vol.Coerce(int), vol.Range(min=1, max=255)),
+                            }
+                        )
+                    ],
+                    vol.Optional("pnum"): vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
+                }
+            ),
+            supports_response=SupportsResponse.OPTIONAL,
+        )
+
+        async def _handle_delete_custom_program(call: ServiceCall) -> None:
+            """Delete a global custom programme by pnum."""
+            store: CustomProgramStore = hass.data[DOMAIN]["_programs"]
+            await store.async_delete(call.data["pnum"])
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_DELETE_CUSTOM_PROGRAM,
+            _handle_delete_custom_program,
+            schema=vol.Schema(
+                {vol.Required("pnum"): vol.All(vol.Coerce(int), vol.Range(min=120, max=255))}
+            ),
+        )
+
+    # Initial poll: best-effort and NON-BLOCKING.  Awaiting async_refresh() here
+    # would stall HA startup by up to BLE_POLL_TOTAL_TIMEOUT + several connect
+    # attempts while the BLE stack waits for a possibly-sleeping toothbrush,
+    # triggering HA's "still starting / not everything available" warning.
+    # Run it as a background task tied to the entry lifecycle instead so setup
+    # returns immediately; entities stay unavailable until the poll succeeds
+    # (on the configured interval or via a manual service call).  The task is
+    # cancelled automatically on unload.
+    entry.async_create_background_task(
+        hass,
+        coordinator.async_refresh(),
+        name=f"{DOMAIN}_initial_refresh_{entry.entry_id}",
+    )
 
     return True
 
@@ -190,6 +295,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not remaining:
             await _detach_file_handler(hass)
             hass.services.async_remove(DOMAIN, SERVICE_POLL)
+            hass.services.async_remove(DOMAIN, SERVICE_SET_CUSTOM_SCHEME)
+            hass.services.async_remove(DOMAIN, SERVICE_SAVE_CUSTOM_PROGRAM)
+            hass.services.async_remove(DOMAIN, SERVICE_DELETE_CUSTOM_PROGRAM)
+            hass.data.get(DOMAIN, {}).pop("_programs", None)
     return unload_ok
 
 

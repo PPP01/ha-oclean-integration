@@ -10,6 +10,23 @@ POLL_INTERVAL_MANUAL = 0  # sentinel: disable automatic polling; only poll on-de
 
 # Service names
 SERVICE_POLL = "poll"
+SERVICE_SET_CUSTOM_SCHEME = "set_custom_scheme"
+SERVICE_SAVE_CUSTOM_PROGRAM = "save_custom_program"
+SERVICE_DELETE_CUSTOM_PROGRAM = "delete_custom_program"
+
+# Global, cross-device custom-programme store (shared by all config entries).
+# File: .storage/oclean_ble_custom_programs
+PROGRAMS_STORAGE_KEY = f"{DOMAIN}_custom_programs"
+PROGRAMS_STORAGE_VERSION = 1
+
+# Dispatcher signal fired whenever the custom-programme store changes, so every
+# select entity refreshes its options + `programs` attribute.
+SIGNAL_PROGRAMS_UPDATED = f"{DOMAIN}_programs_updated"
+
+# Reserved pnum for "send/test without saving": below the custom range (>=120)
+# and above every preset, so a test write clobbers neither a preset nor a saved
+# custom programme.
+SCRATCH_PNUM = 119
 
 # BLE UUIDs
 OCLEAN_SERVICE_UUID = "8082caa8-41a6-4021-91c6-56f9b954cc18"
