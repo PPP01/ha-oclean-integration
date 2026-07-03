@@ -352,6 +352,11 @@ SCHEMES_BY_MODEL: dict[str, dict[int, tuple[str, list[tuple[int, int]]]]] = {
     "OCLEANY5": OCLEANY5_SCHEMES,  # Oclean Z1 — different pnum range (91-104)
 }
 
+# Event fired once per newly imported brushing session (including backfilled
+# sessions with their historical timestamp). Payload: entry_id, mac,
+# device_name, ts, score, duration, duration_scheduled, pnum.
+EVENT_BRUSH_SESSION = "oclean_ble_brush_session"
+
 # Persistent storage for session history
 STORAGE_VERSION = 1
 

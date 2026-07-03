@@ -74,6 +74,7 @@ from .const import (
     DIS_MODEL_UUID,
     DIS_SW_REV_UUID,
     DOMAIN,
+    EVENT_BRUSH_SESSION,
     MAX_SESSION_PAGES,
     OCLEANY3M_SCHEMES,
     READ_NOTIFY_CHAR_UUID,
@@ -956,6 +957,30 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
 
         # Count new sessions before _import_new_sessions updates _last_session_ts
         new_session_count = sum(1 for s in all_sessions if s.get(DATA_LAST_BRUSH_TIME, 0) > self._last_session_ts)
+
+        # Fire one event per NEW session (also for backfilled ones with their
+        # historical timestamp) so automations can log every brushing session —
+        # the last-session sensor only jumps to the newest and would miss
+        # sessions delivered in the same poll.
+        if new_session_count:
+            entry = getattr(self, "config_entry", None)
+            for s in sorted(all_sessions, key=lambda x: x.get(DATA_LAST_BRUSH_TIME, 0)):
+                ts = s.get(DATA_LAST_BRUSH_TIME, 0)
+                if ts <= self._last_session_ts:
+                    continue
+                self.hass.bus.async_fire(
+                    EVENT_BRUSH_SESSION,
+                    {
+                        "entry_id": entry.entry_id if entry else None,
+                        "mac": self._mac,
+                        "device_name": self._device_name,
+                        "ts": ts,
+                        "score": s.get(DATA_LAST_BRUSH_SCORE),
+                        "duration": s.get(DATA_LAST_BRUSH_DURATION),
+                        "duration_scheduled": s.get(DATA_LAST_BRUSH_DURATION_SCHEDULED),
+                        "pnum": s.get(DATA_LAST_BRUSH_PNUM),
+                    },
+                )
 
         # Import new sessions into HA long-term statistics
         if all_sessions:
