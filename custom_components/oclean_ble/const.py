@@ -89,6 +89,9 @@ DEFAULT_POST_BRUSH_COOLDOWN = 0
 DATA_BATTERY = "battery"
 DATA_LAST_BRUSH_SCORE = "last_brush_score"
 DATA_LAST_BRUSH_DURATION = "last_brush_duration"
+# Scheduled programme length of the last session (the record's bytes-7-8 field);
+# real brushed time lives in DATA_LAST_BRUSH_DURATION. Shown as sensor attribute.
+DATA_LAST_BRUSH_DURATION_SCHEDULED = "last_brush_duration_scheduled"
 DATA_LAST_BRUSH_PRESSURE = "last_brush_pressure"
 DATA_LAST_BRUSH_TIME = "last_brush_time"
 

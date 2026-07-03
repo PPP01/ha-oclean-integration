@@ -28,6 +28,7 @@ from .const import (
     DATA_LAST_BRUSH_AREAS,
     DATA_LAST_BRUSH_COVERAGE,
     DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_DURATION_SCHEDULED,
     DATA_LAST_BRUSH_GESTURE_ARRAY,
     DATA_LAST_BRUSH_GESTURE_CODE,
     DATA_LAST_BRUSH_PNUM,
@@ -101,15 +102,8 @@ SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
         # Primary sensor (not diagnostic): coverage is a user-facing brushing-quality
         # metric alongside the score. 0–100 %: covered zones / 8 (per-zone share-based).
     ),
-    SensorEntityDescription(
-        key=DATA_LAST_BRUSH_DURATION,
-        translation_key=DATA_LAST_BRUSH_DURATION,
-        device_class=SensorDeviceClass.DURATION,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfTime.SECONDS,
-        suggested_unit_of_measurement=UnitOfTime.MINUTES,
-        icon="mdi:timer",
-    ),
+    # NOTE: DATA_LAST_BRUSH_DURATION is handled by OcleanDurationSensor below
+    # (same description/unique_id, adds the scheduled programme length attribute).
     SensorEntityDescription(
         key=DATA_LAST_BRUSH_PRESSURE,
         translation_key=DATA_LAST_BRUSH_PRESSURE,
@@ -201,6 +195,18 @@ SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
     # NOTE: Duration Rating, Pressure Detail, and Power Distribution are custom sensors below.
 )
 
+# Description for the duration sensor (instantiated as OcleanDurationSensor so it
+# can expose the scheduled programme length as an attribute).
+_DURATION_DESCRIPTION = SensorEntityDescription(
+    key=DATA_LAST_BRUSH_DURATION,
+    translation_key=DATA_LAST_BRUSH_DURATION,
+    device_class=SensorDeviceClass.DURATION,
+    state_class=SensorStateClass.MEASUREMENT,
+    native_unit_of_measurement=UnitOfTime.SECONDS,
+    suggested_unit_of_measurement=UnitOfTime.MINUTES,
+    icon="mdi:timer",
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -219,6 +225,7 @@ async def async_setup_entry(
     entities.append(OcleanSchemeSensor(coordinator, mac, device_name))
     entities.extend(OcleanToothAreaSensor(coordinator, mac, device_name, zone_name) for zone_name in TOOTH_AREA_NAMES)
     entities.append(OcleanMacSensor(coordinator, mac, device_name))
+    entities.append(OcleanDurationSensor(coordinator, mac, device_name))
     entities.append(OcleanDurationRatingSensor(coordinator, mac, device_name))
     entities.append(OcleanPressureDetailSensor(coordinator, mac, device_name))
     entities.append(OcleanPowerDistributionSensor(coordinator, mac, device_name))
@@ -516,6 +523,26 @@ class OcleanPowerDistributionSensor(OcleanEntity, SensorEntity):
     @property
     def available(self) -> bool:
         return self._session_field_available(self._get_power())
+
+
+class OcleanDurationSensor(OcleanSensor):
+    """Duration sensor whose state is the REAL brushed time of the last session.
+
+    Session records carry two durations: the scheduled programme length and the
+    actually-brushed seconds (validDuration). The state holds the real time; the
+    scheduled length is exposed as the `scheduled_duration_s` attribute so
+    dashboards can render e.g. "31 s of 3:00 min".
+    """
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, _DURATION_DESCRIPTION, mac, device_name)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.coordinator.data is None:
+            return None
+        scheduled = self.coordinator.data.get(DATA_LAST_BRUSH_DURATION_SCHEDULED)
+        return {"scheduled_duration_s": scheduled} if scheduled is not None else None
 
 
 class OcleanMacSensor(OcleanEntity, SensorEntity):
