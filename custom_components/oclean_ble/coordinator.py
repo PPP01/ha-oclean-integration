@@ -93,6 +93,7 @@ from .parser import (
     parse_y3p_stream_record,
 )
 from .protocol import UNKNOWN, DeviceProtocol, is_known_model, protocol_for_model
+from .session_group import combined_score, extend_group, is_group_continuation, new_group
 from .statistics import import_new_sessions
 
 _LOGGER = logging.getLogger(__name__)
@@ -393,6 +394,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         update_interval: int,
         poll_windows: str = "",
         post_brush_cooldown_h: int = 0,
+        merge_window_min: int = 0,
     ) -> None:
         super().__init__(
             hass,
@@ -450,6 +452,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         self._post_brush_cooldown_s: int = post_brush_cooldown_h * 3600
         # Unix timestamp until which polls are suppressed after a new session.
         self._cooldown_until: float = 0.0
+
+        # Back-to-back session merging (0 = off). Groups sessions whose gap to
+        # the previous session's end is <= the window; the integration computes
+        # its own capped-sum score per group (see session_group.py). The group
+        # state is persisted so merging works across polls and HA restarts.
+        self._merge_window_s: int = max(0, int(merge_window_min)) * 60
+        self._session_group: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # DataUpdateCoordinator interface
@@ -730,6 +739,42 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         """Return the pnum of the last-applied brush scheme, or None if never set."""
         return self._active_scheme_pnum
 
+    # ------------------------------------------------------------------
+    # Back-to-back session group (integration-computed values)
+    # ------------------------------------------------------------------
+
+    @property
+    def merge_enabled(self) -> bool:
+        """True when back-to-back session merging is configured (> 0 min)."""
+        return self._merge_window_s > 0
+
+    @property
+    def group_score(self) -> int | None:
+        """Integration score of the current group: min(100, sum of run scores)."""
+        if not self._session_group:
+            return None
+        return combined_score(self._session_group["scores"])
+
+    @property
+    def group_duration(self) -> int | None:
+        """Total real brushing seconds of the current group."""
+        if not self._session_group:
+            return None
+        return sum(self._session_group["durations"])
+
+    @property
+    def group_info(self) -> dict[str, Any] | None:
+        """Attribute payload for the group sensors (runs, scores, start)."""
+        if not self._session_group:
+            return None
+        scores = self._session_group["scores"]
+        return {
+            "sessions": len(scores),
+            "einzel_scores": scores,
+            "firmware_score_letzte": next((s for s in reversed(scores) if s is not None), None),
+            "start_ts": self._session_group.get("start_ts"),
+        }
+
     async def async_set_brush_scheme(self, pnum: int) -> None:
         """Connect and send the SetBrushScheme command (0206) to the device.
 
@@ -867,6 +912,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             self._brush_head_max_days = stored.get("brush_head_max_days")
             self._brush_head_sw_count = stored.get("brush_head_sw_count", 0)
             self._active_scheme_pnum = stored.get("active_scheme_pnum")
+            self._session_group = stored.get("session_group")
             last_session = stored.get("last_session", {})
             if last_session:
                 self._last_raw.update(last_session)
@@ -891,6 +937,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                 "brush_head_max_days": self._brush_head_max_days,
                 "brush_head_sw_count": self._brush_head_sw_count,
                 "active_scheme_pnum": self._active_scheme_pnum,
+                "session_group": self._session_group,
                 "last_session": last_session,
             }
         )
@@ -968,6 +1015,20 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                 ts = s.get(DATA_LAST_BRUSH_TIME, 0)
                 if ts <= self._last_session_ts:
                     continue
+                score = s.get(DATA_LAST_BRUSH_SCORE)
+                duration = s.get(DATA_LAST_BRUSH_DURATION)
+
+                # Back-to-back grouping: continue the persisted group when the
+                # gap to its end is within the configured merge window.
+                continuation = self._merge_window_s > 0 and is_group_continuation(
+                    (self._session_group or {}).get("end_ts", 0), ts, self._merge_window_s
+                )
+                if self._merge_window_s > 0:
+                    if continuation and self._session_group is not None:
+                        extend_group(self._session_group, ts, duration or 0, score)
+                    else:
+                        self._session_group = new_group(ts, duration or 0, score)
+
                 self.hass.bus.async_fire(
                     EVENT_BRUSH_SESSION,
                     {
@@ -975,10 +1036,12 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                         "mac": self._mac,
                         "device_name": self._device_name,
                         "ts": ts,
-                        "score": s.get(DATA_LAST_BRUSH_SCORE),
-                        "duration": s.get(DATA_LAST_BRUSH_DURATION),
+                        "score": score,
+                        "duration": duration,
                         "duration_scheduled": s.get(DATA_LAST_BRUSH_DURATION_SCHEDULED),
                         "pnum": s.get(DATA_LAST_BRUSH_PNUM),
+                        "group_continuation": continuation,
+                        "group_size": len(self._session_group["scores"]) if self._session_group else 1,
                     },
                 )
 

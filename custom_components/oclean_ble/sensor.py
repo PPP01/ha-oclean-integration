@@ -226,6 +226,9 @@ async def async_setup_entry(
     entities.extend(OcleanToothAreaSensor(coordinator, mac, device_name, zone_name) for zone_name in TOOTH_AREA_NAMES)
     entities.append(OcleanMacSensor(coordinator, mac, device_name))
     entities.append(OcleanDurationSensor(coordinator, mac, device_name))
+    if coordinator.merge_enabled:
+        entities.append(OcleanGroupScoreSensor(coordinator, mac, device_name))
+        entities.append(OcleanGroupDurationSensor(coordinator, mac, device_name))
     entities.append(OcleanDurationRatingSensor(coordinator, mac, device_name))
     entities.append(OcleanPressureDetailSensor(coordinator, mac, device_name))
     entities.append(OcleanPowerDistributionSensor(coordinator, mac, device_name))
@@ -543,6 +546,57 @@ class OcleanDurationSensor(OcleanSensor):
             return None
         scheduled = self.coordinator.data.get(DATA_LAST_BRUSH_DURATION_SCHEDULED)
         return {"scheduled_duration_s": scheduled} if scheduled is not None else None
+
+
+class OcleanGroupScoreSensor(OcleanEntity, SensorEntity):
+    """Integration-computed score for a group of back-to-back sessions.
+
+    When the merge window (options flow) is > 0, back-to-back runs form a
+    group; the state is min(100, sum of the firmware scores) — two half
+    brushings of 50 % + 60 % count as one full 100 % brushing. Attributes
+    expose the individual firmware scores for internal-vs-external comparison.
+    """
+
+    _attr_translation_key = "group_score"
+    _attr_icon = "mdi:star-check"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, "group_score")
+
+    @property
+    def native_value(self) -> int | None:
+        return self.coordinator.group_score
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        return self.coordinator.group_info
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.merge_enabled
+
+
+class OcleanGroupDurationSensor(OcleanEntity, SensorEntity):
+    """Total real brushing time of the current back-to-back session group."""
+
+    _attr_translation_key = "group_duration"
+    _attr_icon = "mdi:timer-plus"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    _attr_suggested_unit_of_measurement = UnitOfTime.MINUTES
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, "group_duration")
+
+    @property
+    def native_value(self) -> int | None:
+        return self.coordinator.group_duration
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.merge_enabled
 
 
 class OcleanMacSensor(OcleanEntity, SensorEntity):

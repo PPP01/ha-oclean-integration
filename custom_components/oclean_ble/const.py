@@ -78,12 +78,14 @@ CONF_POLL_INTERVAL = "poll_interval"
 CONF_DEVICE_NAME = "device_name"
 CONF_POLL_WINDOWS = "poll_windows"  # str: "HH:MM-HH:MM[, HH:MM-HH:MM, ...]", "" = disabled
 CONF_POST_BRUSH_COOLDOWN = "post_brush_cooldown"  # int hours, 0 = disabled
+CONF_MERGE_WINDOW = "merge_window"  # int minutes (0-5), 0 = session merging disabled
 
 # Options-flow fields for the multi-step window setup (not persisted; combined into CONF_POLL_WINDOWS).
 CONF_WINDOW_COUNT = "window_count"  # int 0-3: how many poll windows the user wants
 CONF_WINDOW_START = "window_start"  # str "HH:MM:SS": start time in a per-window step
 CONF_WINDOW_END = "window_end"  # str "HH:MM:SS": end time in a per-window step
 DEFAULT_POST_BRUSH_COOLDOWN = 0
+DEFAULT_MERGE_WINDOW = 0
 
 # Coordinator data keys
 DATA_BATTERY = "battery"

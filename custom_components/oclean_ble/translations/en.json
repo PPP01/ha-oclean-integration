@@ -166,6 +166,12 @@
       },
       "zone_lower_right_in": {
         "name": "Zone Lower Right In"
+      },
+      "group_score": {
+        "name": "Merged score"
+      },
+      "group_duration": {
+        "name": "Merged duration"
       }
     }
   },
@@ -176,12 +182,14 @@
         "data": {
           "poll_interval": "Poll interval (seconds)",
           "post_brush_cooldown": "Post-brush cooldown (hours)",
-          "window_count": "Number of brushing time windows"
+          "window_count": "Number of brushing time windows",
+          "merge_window": "Merge sessions (minutes)"
         },
         "data_description": {
           "poll_interval": "How often to poll the toothbrush over Bluetooth. Minimum 60 s. Set to 0 to disable automatic polling (manual only).",
           "post_brush_cooldown": "Pause polling for this many hours after a new brushing session is detected. Set to 0 to disable.",
-          "window_count": "Restrict polling to specific time windows (e.g. morning and evening brushing). Set to 0 to always poll."
+          "window_count": "Restrict polling to specific time windows (e.g. morning and evening brushing). Set to 0 to always poll.",
+          "merge_window": "Merge back-to-back brushing sessions (gap ≤ X minutes) into one group. The integration score is the capped sum of the run scores (max. 100 %). 0 = disabled."
         }
       },
       "window_1": {

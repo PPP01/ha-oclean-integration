@@ -18,11 +18,13 @@ from .const import (
     CONF_MAC_ADDRESS,
     CONF_POLL_INTERVAL,
     CONF_POLL_WINDOWS,
+    CONF_MERGE_WINDOW,
     CONF_POST_BRUSH_COOLDOWN,
     CONF_WINDOW_COUNT,
     CONF_WINDOW_END,
     CONF_WINDOW_START,
     DEFAULT_POLL_INTERVAL,
+    DEFAULT_MERGE_WINDOW,
     DEFAULT_POST_BRUSH_COOLDOWN,
     DOMAIN,
     MIN_POLL_INTERVAL,
@@ -263,6 +265,7 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
     def __init__(self) -> None:
         self._poll_interval: int = DEFAULT_POLL_INTERVAL
         self._cooldown: int = DEFAULT_POST_BRUSH_COOLDOWN
+        self._merge_window: int = DEFAULT_MERGE_WINDOW
         self._window_count: int = 0
         # Windows parsed from the current config – used to pre-fill each window step.
         self._existing_windows: list[tuple[str, str]] = []
@@ -281,6 +284,7 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
                 errors[CONF_POLL_INTERVAL] = err
             else:
                 self._cooldown = int(user_input.get(CONF_POST_BRUSH_COOLDOWN, DEFAULT_POST_BRUSH_COOLDOWN))
+                self._merge_window = int(user_input.get(CONF_MERGE_WINDOW, DEFAULT_MERGE_WINDOW))
                 self._window_count = int(user_input.get(CONF_WINDOW_COUNT, 0))
                 self._collected_windows = []
                 if self._window_count > 0:
@@ -290,6 +294,7 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
                     data={
                         CONF_POLL_INTERVAL: self._poll_interval,
                         CONF_POST_BRUSH_COOLDOWN: self._cooldown,
+                        CONF_MERGE_WINDOW: self._merge_window,
                         CONF_POLL_WINDOWS: "",
                     },
                 )
@@ -299,6 +304,7 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
             self.config_entry.data.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL),
         )
         current_cooldown = int(self.config_entry.options.get(CONF_POST_BRUSH_COOLDOWN, DEFAULT_POST_BRUSH_COOLDOWN))
+        current_merge = int(self.config_entry.options.get(CONF_MERGE_WINDOW, DEFAULT_MERGE_WINDOW))
         self._existing_windows = _parse_windows_list(self.config_entry.options.get(CONF_POLL_WINDOWS, ""))
         current_count = len(self._existing_windows)
 
@@ -322,6 +328,15 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
                             max=23,
                             step=1,
                             unit_of_measurement="h",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(CONF_MERGE_WINDOW, default=current_merge): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0,
+                            max=5,
+                            step=1,
+                            unit_of_measurement="min",
                             mode=selector.NumberSelectorMode.BOX,
                         )
                     ),
@@ -365,6 +380,7 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
                     data={
                         CONF_POLL_INTERVAL: self._poll_interval,
                         CONF_POST_BRUSH_COOLDOWN: self._cooldown,
+                        CONF_MERGE_WINDOW: self._merge_window,
                         CONF_POLL_WINDOWS: _windows_list_to_str(self._collected_windows),
                     },
                 )
