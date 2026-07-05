@@ -22,6 +22,7 @@ def _make_coordinator():
     coord.async_reset_brush_head = AsyncMock()
     coord.async_sync_time = AsyncMock()
     coord.async_request_refresh = AsyncMock()
+    coord.async_poll_now = AsyncMock()
     return coord
 
 
@@ -79,7 +80,7 @@ class TestOcleanButtonAsyncPress:
     async def test_poll_now(self):
         button, coord = _make_button("poll_now")
         await button.async_press()
-        coord.async_request_refresh.assert_awaited_once()
+        coord.async_poll_now.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

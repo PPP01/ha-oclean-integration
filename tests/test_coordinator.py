@@ -860,6 +860,53 @@ class TestPollSkipReason:
 
 
 # ---------------------------------------------------------------------------
+# async_poll_now – manual poll bypasses window/cooldown gating
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncPollNow:
+    @pytest.mark.asyncio
+    async def test_manual_poll_bypasses_active_gates(self):
+        import time
+
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._cooldown_until = time.time() + 3600
+        coord._last_raw = {DATA_BATTERY: 80}
+        coord._poll_device = AsyncMock(return_value={DATA_BATTERY: 91})
+        coord._force_poll_once = True
+        result = await coord._async_update_data()
+        coord._poll_device.assert_awaited_once()
+        assert result.battery == 91
+
+    @pytest.mark.asyncio
+    async def test_scheduled_poll_still_gated(self):
+        import time
+
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._cooldown_until = time.time() + 3600
+        coord._last_raw = {DATA_BATTERY: 80}
+        coord._poll_device = AsyncMock()
+        result = await coord._async_update_data()
+        coord._poll_device.assert_not_awaited()
+        assert result.battery == 80
+
+    @pytest.mark.asyncio
+    async def test_async_poll_now_sets_and_resets_flag(self):
+        coord = _make_coordinator()
+        seen = {}
+
+        async def _fake_refresh():
+            seen["forced"] = coord._force_poll_once
+
+        coord.async_refresh = _fake_refresh
+        await coord.async_poll_now()
+        assert seen["forced"] is True
+        assert coord._force_poll_once is False
+
+
+# ---------------------------------------------------------------------------
 # _async_update_data – skip path (with and without stale data)
 # ---------------------------------------------------------------------------
 

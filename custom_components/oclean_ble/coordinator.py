@@ -436,6 +436,11 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         # Used by _poll_device to decide if a disconnect+reconnect retry is warranted.
         self._last_subscribe_ok: bool = True
 
+        # Set by async_poll_now(): the next update bypasses window/cooldown
+        # gating - smart-polling restrictions target SCHEDULED polls, an
+        # explicit user action must always attempt a connection.
+        self._force_poll_once: bool = False
+
         # Unix timestamp of the last successful DIS read.  0.0 = never read.
         # DIS values (model, firmware, hw revision) are stable but could change
         # after a firmware update, so we re-read them every 24 hours.
@@ -462,7 +467,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         # Exception: always poll when no cached data exists so that the initial
         # setup (or first poll after a restart with no persisted store) completes
         # regardless of configured windows.
-        skip_reason = self._poll_skip_reason()
+        skip_reason = None if self._force_poll_once else self._poll_skip_reason()
         if skip_reason and self._last_raw:
             self._log.debug("poll skipped: %s", skip_reason)
             return OcleanDeviceData.from_dict(self._last_raw)
@@ -836,6 +841,18 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                 return f"outside poll windows ({windows_str})"
 
         return None
+
+    async def async_poll_now(self) -> None:
+        """User-requested poll: bypass window/cooldown restrictions once.
+
+        Used by the poll button and the oclean_ble.poll service. Scheduled
+        polls keep honouring the smart-polling gates (_poll_skip_reason).
+        """
+        self._force_poll_once = True
+        try:
+            await self.async_refresh()
+        finally:
+            self._force_poll_once = False
 
     def _resolve_ble_device(self) -> BLEDevice:
         """BLEDevice from HA Bluetooth registry; raises BleakError if not found."""

@@ -63,4 +63,4 @@ class OcleanButton(OcleanEntity, ButtonEntity):
         elif self.entity_description.key == "sync_time":
             await self.coordinator.async_sync_time()
         elif self.entity_description.key == "poll_now":
-            await self.coordinator.async_request_refresh()
+            await self.coordinator.async_poll_now()
