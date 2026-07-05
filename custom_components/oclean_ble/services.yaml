@@ -12,3 +12,32 @@ poll:
       required: false
       selector:
         text:
+
+get_zone_history:
+  name: Get zone history
+  description: >
+    Return the stored per-session zone history (8 per-zone seconds, duration,
+    score) for one toothbrush, newest first. Requires the zone-history option
+    to be enabled for the device.
+  fields:
+    entry_id:
+      name: Device
+      description: The Oclean config entry to query.
+      required: true
+      selector:
+        config_entry:
+          integration: oclean_ble
+    start:
+      name: Start
+      description: Only return sessions at or after this date/time.
+      required: false
+      example: "2026-06-01 00:00:00"
+      selector:
+        datetime:
+    end:
+      name: End
+      description: Only return sessions at or before this date/time.
+      required: false
+      example: "2026-07-01 00:00:00"
+      selector:
+        datetime:

@@ -215,10 +215,10 @@ class TestAsyncSetupEntry:
 
         asyncio.run(async_setup_entry(hass, entry))
 
-        hass.services.async_register.assert_called_once()
-        call_args = hass.services.async_register.call_args
-        assert call_args[0][0] == DOMAIN
-        assert call_args[0][1] == SERVICE_POLL
+        registered = [(c[0][0], c[0][1]) for c in hass.services.async_register.call_args_list]
+        assert (DOMAIN, SERVICE_POLL) in registered
+        assert (DOMAIN, "get_zone_history") in registered
+        assert len(registered) == 2
 
     @patch("custom_components.oclean_ble._attach_file_handler", new_callable=AsyncMock)
     @patch("custom_components.oclean_ble.OcleanCoordinator")
@@ -295,7 +295,9 @@ class TestAsyncUnloadEntry:
         asyncio.run(async_setup_entry(hass, entry))
         asyncio.run(async_unload_entry(hass, entry))
 
-        hass.services.async_remove.assert_called_once_with(DOMAIN, SERVICE_POLL)
+        removed = [(c[0][0], c[0][1]) for c in hass.services.async_remove.call_args_list]
+        assert (DOMAIN, SERVICE_POLL) in removed
+        assert (DOMAIN, "get_zone_history") in removed
 
     @patch("custom_components.oclean_ble._detach_file_handler", new_callable=AsyncMock)
     @patch("custom_components.oclean_ble._attach_file_handler", new_callable=AsyncMock)

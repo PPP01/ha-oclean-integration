@@ -11,7 +11,9 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.const import __version__ as HA_VERSION
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_DEVICE_NAME,
@@ -20,10 +22,13 @@ from .const import (
     CONF_POLL_INTERVAL,
     CONF_POLL_WINDOWS,
     CONF_POST_BRUSH_COOLDOWN,
+    CONF_ZONE_HISTORY,
     DEFAULT_MERGE_WINDOW,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_POST_BRUSH_COOLDOWN,
+    DEFAULT_ZONE_HISTORY,
     DOMAIN,
+    SERVICE_GET_ZONE_HISTORY,
     SERVICE_POLL,
 )
 from .coordinator import OcleanCoordinator
@@ -117,6 +122,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     poll_windows = entry.options.get(CONF_POLL_WINDOWS, "")
     post_brush_cooldown_h = int(entry.options.get(CONF_POST_BRUSH_COOLDOWN, DEFAULT_POST_BRUSH_COOLDOWN))
     merge_window_min = int(entry.options.get(CONF_MERGE_WINDOW, DEFAULT_MERGE_WINDOW))
+    zone_history_days = int(entry.options.get(CONF_ZONE_HISTORY, DEFAULT_ZONE_HISTORY))
 
     _LOGGER.info(
         "Oclean integration v%s starting: mac=%s name=%s (HA %s)",
@@ -140,6 +146,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         poll_windows=poll_windows,
         post_brush_cooldown_h=post_brush_cooldown_h,
         merge_window_min=merge_window_min,
+        zone_history_days=zone_history_days,
     )
 
     # Register coordinator and set up platforms *before* the first poll so that
@@ -176,6 +183,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=vol.Schema({vol.Optional("entry_id"): str}),
         )
 
+        async def _handle_get_zone_history(call: ServiceCall) -> dict[str, object]:
+            """Return the stored per-session zone history for one device."""
+            entry_id: str = call.data["entry_id"]
+            coordinator = hass.data.get(DOMAIN, {}).get(entry_id)
+            if not isinstance(coordinator, OcleanCoordinator):
+                raise ServiceValidationError(f"No Oclean device for entry_id {entry_id!r}")
+            sessions = coordinator.zone_history
+            if start := call.data.get("start"):
+                start_dt = dt_util.parse_datetime(str(start))
+                if start_dt is not None:
+                    start_ts = int(dt_util.as_timestamp(start_dt))
+                    sessions = [s for s in sessions if s["ts"] >= start_ts]
+            if end := call.data.get("end"):
+                end_dt = dt_util.parse_datetime(str(end))
+                if end_dt is not None:
+                    end_ts = int(dt_util.as_timestamp(end_dt))
+                    sessions = [s for s in sessions if s["ts"] <= end_ts]
+            return {"sessions": list(reversed(sessions))}
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_GET_ZONE_HISTORY,
+            _handle_get_zone_history,
+            schema=vol.Schema(
+                {
+                    vol.Required("entry_id"): str,
+                    vol.Optional("start"): str,
+                    vol.Optional("end"): str,
+                }
+            ),
+            supports_response=SupportsResponse.ONLY,
+        )
+
     # Initial poll: best-effort.  If the device is sleeping, entities stay
     # unavailable and will update as soon as the next poll succeeds (either on
     # the configured interval or via a manual service call).
@@ -194,6 +234,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not remaining:
             await _detach_file_handler(hass)
             hass.services.async_remove(DOMAIN, SERVICE_POLL)
+            hass.services.async_remove(DOMAIN, SERVICE_GET_ZONE_HISTORY)
     return unload_ok
 
 

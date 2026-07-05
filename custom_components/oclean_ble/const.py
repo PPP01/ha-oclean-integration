@@ -10,6 +10,7 @@ POLL_INTERVAL_MANUAL = 0  # sentinel: disable automatic polling; only poll on-de
 
 # Service names
 SERVICE_POLL = "poll"
+SERVICE_GET_ZONE_HISTORY = "get_zone_history"
 
 # BLE UUIDs
 OCLEAN_SERVICE_UUID = "8082caa8-41a6-4021-91c6-56f9b954cc18"
@@ -86,6 +87,9 @@ CONF_WINDOW_START = "window_start"  # str "HH:MM:SS": start time in a per-window
 CONF_WINDOW_END = "window_end"  # str "HH:MM:SS": end time in a per-window step
 DEFAULT_POST_BRUSH_COOLDOWN = 0
 DEFAULT_MERGE_WINDOW = 0
+
+CONF_ZONE_HISTORY = "zone_history_days"  # int days: 0 = disabled, -1 = unlimited, N = keep N days
+DEFAULT_ZONE_HISTORY = 0
 
 # Coordinator data keys
 DATA_BATTERY = "battery"
@@ -202,6 +206,13 @@ AREA_COVERAGE_Y3PD_THRESHOLD = 10
 
 # Tooth area zone names in BrushAreaType enum order (value 1 → index 0 … value 8 → index 7)
 # Source: com/ocleanble/lib/device/BrushAreaType.java
+# Models whose per-zone values are fixed-total time slots instead of seconds.
+# OCLEANY3MD (Oclean X): every session sums to exactly 96 = 8 zones x 12 slots
+# (at 2.5 s in the 4-min programme; matches getTime12() in the APK). For these
+# models the coordinator scales the zone values to real seconds before
+# emitting/storing them (zones_to_seconds).
+ZONE_SLOT_MODELS: frozenset[str] = frozenset({"OCLEANY3MD"})
+
 TOOTH_AREA_NAMES: tuple[str, ...] = (
     "upper_left_out",  # AREA_LIFT_UP_OUT    (value 1)
     "upper_left_in",  # AREA_LIFT_UP_IN     (value 2)

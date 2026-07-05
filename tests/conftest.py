@@ -44,6 +44,13 @@ def _install_ha_stubs() -> None:
     core.ServiceCall = MagicMock
     core.callback = lambda f: f
 
+    class SupportsResponse:
+        NONE = "none"
+        OPTIONAL = "optional"
+        ONLY = "only"
+
+    core.SupportsResponse = SupportsResponse
+
     # ---- homeassistant.const ----
     from enum import Enum, StrEnum
 
@@ -71,7 +78,32 @@ def _install_ha_stubs() -> None:
     class ConfigEntryNotReady(Exception):
         pass
 
+    class ServiceValidationError(Exception):
+        pass
+
     exc.ConfigEntryNotReady = ConfigEntryNotReady
+    exc.ServiceValidationError = ServiceValidationError
+
+    # ---- homeassistant.util.dt ----
+    import datetime as _dt
+
+    _stub("homeassistant.util")
+    dt_util = _stub("homeassistant.util.dt")
+
+    def _parse_datetime(value):
+        try:
+            return _dt.datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+
+    def _as_timestamp(value):
+        dt_obj = value if isinstance(value, _dt.datetime) else _parse_datetime(value)
+        if dt_obj.tzinfo is None:
+            dt_obj = dt_obj.replace(tzinfo=_dt.timezone.utc)
+        return dt_obj.timestamp()
+
+    dt_util.parse_datetime = _parse_datetime
+    dt_util.as_timestamp = _as_timestamp
 
     # ---- homeassistant.data_entry_flow ----
     daf = _stub("homeassistant.data_entry_flow")
@@ -145,9 +177,31 @@ def _install_ha_stubs() -> None:
         def __call__(self, value):
             return value
 
+    class SelectSelectorMode:
+        DROPDOWN = "dropdown"
+        LIST = "list"
+
+    def SelectOptionDict(value, label):
+        return {"value": value, "label": label}
+
+    class SelectSelectorConfig:
+        def __init__(self, **kwargs):
+            pass
+
+    class SelectSelector:
+        def __init__(self, config=None):
+            pass
+
+        def __call__(self, value):
+            return value
+
     sel.TextSelectorConfig = TextSelectorConfig
     sel.TextSelector = TextSelector
     sel.TimeSelector = TimeSelector
+    sel.SelectSelectorMode = SelectSelectorMode
+    sel.SelectOptionDict = SelectOptionDict
+    sel.SelectSelectorConfig = SelectSelectorConfig
+    sel.SelectSelector = SelectSelector
 
     # ---- homeassistant.helpers.update_coordinator ----
     uc = _stub("homeassistant.helpers.update_coordinator")

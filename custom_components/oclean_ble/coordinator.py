@@ -81,7 +81,9 @@ from .const import (
     RECEIVE_BRUSH_UUID,
     SCHEMES_BY_MODEL,
     STORAGE_VERSION,
+    TOOTH_AREA_NAMES,
     WRITE_CHAR_UUID,
+    ZONE_SLOT_MODELS,
 )
 from .models import OcleanDeviceData
 from .parser import (
@@ -95,6 +97,7 @@ from .parser import (
 from .protocol import UNKNOWN, DeviceProtocol, is_known_model, protocol_for_model
 from .session_group import combined_score, extend_group, is_group_continuation, new_group
 from .statistics import import_new_sessions
+from .zone_utils import zone_emoji_signature, zones_to_seconds
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -395,6 +398,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         poll_windows: str = "",
         post_brush_cooldown_h: int = 0,
         merge_window_min: int = 0,
+        zone_history_days: int = 0,
     ) -> None:
         super().__init__(
             hass,
@@ -459,6 +463,11 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         # state is persisted so merging works across polls and HA restarts.
         self._merge_window_s: int = max(0, int(merge_window_min)) * 60
         self._session_group: dict[str, Any] | None = None
+
+        # Per-session zone history (opt-in): 0 = disabled, -1 = unlimited,
+        # N = keep N days. Entries {ts, zones, duration, score, pnum}, ascending.
+        self._zone_history_days: int = int(zone_history_days)
+        self._zone_history: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # DataUpdateCoordinator interface
@@ -775,6 +784,11 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             "start_ts": self._session_group.get("start_ts"),
         }
 
+    @property
+    def zone_history(self) -> list[dict[str, Any]]:
+        """Per-session zone history (ascending by ts)."""
+        return list(self._zone_history)
+
     async def async_set_brush_scheme(self, pnum: int) -> None:
         """Connect and send the SetBrushScheme command (0206) to the device.
 
@@ -913,6 +927,17 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             self._brush_head_sw_count = stored.get("brush_head_sw_count", 0)
             self._active_scheme_pnum = stored.get("active_scheme_pnum")
             self._session_group = stored.get("session_group")
+            self._zone_history = stored.get("zone_history", [])
+            # Normalise slot-scheme entries to seconds (idempotent: after
+            # scaling sum(zones) matches duration, so the guard skips them).
+            model = (stored.get("last_session") or {}).get(DATA_MODEL_ID)
+            if model in ZONE_SLOT_MODELS:
+                for zh_entry in self._zone_history:
+                    z = zh_entry.get("zones")
+                    d = int(zh_entry.get("duration") or 0)
+                    total = sum(v for v in z if v > 0) if z else 0
+                    if total > 0 and d > 0 and abs(total - d) / d > 0.25:
+                        zh_entry["zones"] = zones_to_seconds(z, d)
             last_session = stored.get("last_session", {})
             if last_session:
                 self._last_raw.update(last_session)
@@ -938,6 +963,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                 "brush_head_sw_count": self._brush_head_sw_count,
                 "active_scheme_pnum": self._active_scheme_pnum,
                 "session_group": self._session_group,
+                "zone_history": self._zone_history,
                 "last_session": last_session,
             }
         )
@@ -1018,6 +1044,32 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                 score = s.get(DATA_LAST_BRUSH_SCORE)
                 duration = s.get(DATA_LAST_BRUSH_DURATION)
 
+                areas = s.get(DATA_LAST_BRUSH_AREAS)
+                zones = [int(areas.get(n, 0)) for n in TOOTH_AREA_NAMES] if isinstance(areas, dict) else None
+                # Slot-scheme firmwares (OCLEANY3MD: fixed total of 96 slots)
+                # report unit-less slot counts - convert to real seconds so
+                # events/store/history all speak one unit.
+                model = collected.get(DATA_MODEL_ID) or self._last_raw.get(DATA_MODEL_ID)
+                if zones is not None and model in ZONE_SLOT_MODELS:
+                    zones = zones_to_seconds(zones, duration or 0)
+                zones_emoji = zone_emoji_signature(zones)
+
+                # Retention-managed per-session zone history (opt-in via options flow)
+                if zones is not None and self._zone_history_days != 0:
+                    self._zone_history.append(
+                        {
+                            "ts": ts,
+                            "zones": zones,
+                            "duration": duration,
+                            "score": score,
+                            "pnum": s.get(DATA_LAST_BRUSH_PNUM),
+                        }
+                    )
+                    self._zone_history.sort(key=lambda e: e["ts"])
+                    if self._zone_history_days > 0:
+                        cutoff = int(time.time()) - self._zone_history_days * 86400
+                        self._zone_history = [e for e in self._zone_history if e["ts"] >= cutoff]
+
                 # Back-to-back grouping: continue the persisted group when the
                 # gap to its end is within the configured merge window.
                 continuation = self._merge_window_s > 0 and is_group_continuation(
@@ -1042,6 +1094,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                         "pnum": s.get(DATA_LAST_BRUSH_PNUM),
                         "group_continuation": continuation,
                         "group_size": len(self._session_group["scores"]) if self._session_group else 1,
+                        "zones": zones,
+                        "zones_emoji": zones_emoji,
                     },
                 )
 

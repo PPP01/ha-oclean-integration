@@ -16,16 +16,18 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_DEVICE_NAME,
     CONF_MAC_ADDRESS,
+    CONF_MERGE_WINDOW,
     CONF_POLL_INTERVAL,
     CONF_POLL_WINDOWS,
-    CONF_MERGE_WINDOW,
     CONF_POST_BRUSH_COOLDOWN,
     CONF_WINDOW_COUNT,
     CONF_WINDOW_END,
     CONF_WINDOW_START,
-    DEFAULT_POLL_INTERVAL,
+    CONF_ZONE_HISTORY,
     DEFAULT_MERGE_WINDOW,
+    DEFAULT_POLL_INTERVAL,
     DEFAULT_POST_BRUSH_COOLDOWN,
+    DEFAULT_ZONE_HISTORY,
     DOMAIN,
     MIN_POLL_INTERVAL,
     OCLEAN_SERVICE_UUID,
@@ -266,6 +268,7 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
         self._poll_interval: int = DEFAULT_POLL_INTERVAL
         self._cooldown: int = DEFAULT_POST_BRUSH_COOLDOWN
         self._merge_window: int = DEFAULT_MERGE_WINDOW
+        self._zone_history: int = DEFAULT_ZONE_HISTORY
         self._window_count: int = 0
         # Windows parsed from the current config – used to pre-fill each window step.
         self._existing_windows: list[tuple[str, str]] = []
@@ -285,6 +288,7 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
             else:
                 self._cooldown = int(user_input.get(CONF_POST_BRUSH_COOLDOWN, DEFAULT_POST_BRUSH_COOLDOWN))
                 self._merge_window = int(user_input.get(CONF_MERGE_WINDOW, DEFAULT_MERGE_WINDOW))
+                self._zone_history = int(user_input.get(CONF_ZONE_HISTORY, str(DEFAULT_ZONE_HISTORY)))
                 self._window_count = int(user_input.get(CONF_WINDOW_COUNT, 0))
                 self._collected_windows = []
                 if self._window_count > 0:
@@ -295,6 +299,7 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
                         CONF_POLL_INTERVAL: self._poll_interval,
                         CONF_POST_BRUSH_COOLDOWN: self._cooldown,
                         CONF_MERGE_WINDOW: self._merge_window,
+                        CONF_ZONE_HISTORY: self._zone_history,
                         CONF_POLL_WINDOWS: "",
                     },
                 )
@@ -305,6 +310,7 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
         )
         current_cooldown = int(self.config_entry.options.get(CONF_POST_BRUSH_COOLDOWN, DEFAULT_POST_BRUSH_COOLDOWN))
         current_merge = int(self.config_entry.options.get(CONF_MERGE_WINDOW, DEFAULT_MERGE_WINDOW))
+        current_zone_history = int(self.config_entry.options.get(CONF_ZONE_HISTORY, DEFAULT_ZONE_HISTORY))
         self._existing_windows = _parse_windows_list(self.config_entry.options.get(CONF_POLL_WINDOWS, ""))
         current_count = len(self._existing_windows)
 
@@ -338,6 +344,20 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
                             step=1,
                             unit_of_measurement="min",
                             mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(CONF_ZONE_HISTORY, default=str(current_zone_history)): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                selector.SelectOptionDict(value="0", label="Off"),
+                                selector.SelectOptionDict(value="30", label="30 days"),
+                                selector.SelectOptionDict(value="60", label="60 days"),
+                                selector.SelectOptionDict(value="90", label="90 days"),
+                                selector.SelectOptionDict(value="180", label="180 days"),
+                                selector.SelectOptionDict(value="365", label="365 days"),
+                                selector.SelectOptionDict(value="-1", label="Unlimited"),
+                            ],
+                            mode=selector.SelectSelectorMode.DROPDOWN,
                         )
                     ),
                     vol.Optional(CONF_WINDOW_COUNT, default=current_count): selector.NumberSelector(
@@ -381,6 +401,7 @@ class OcleanOptionsFlow(config_entries.OptionsFlow):
                         CONF_POLL_INTERVAL: self._poll_interval,
                         CONF_POST_BRUSH_COOLDOWN: self._cooldown,
                         CONF_MERGE_WINDOW: self._merge_window,
+                        CONF_ZONE_HISTORY: self._zone_history,
                         CONF_POLL_WINDOWS: _windows_list_to_str(self._collected_windows),
                     },
                 )
