@@ -10,6 +10,29 @@ POLL_INTERVAL_MANUAL = 0  # sentinel: disable automatic polling; only poll on-de
 
 # Service names
 SERVICE_POLL = "poll"
+SERVICE_SET_CUSTOM_SCHEME = "set_custom_scheme"
+SERVICE_SAVE_CUSTOM_PROGRAM = "save_custom_program"
+SERVICE_DELETE_CUSTOM_PROGRAM = "delete_custom_program"
+SERVICE_GET_ZONE_HISTORY = "get_zone_history"
+
+# Global, cross-device custom-programme store (shared by all config entries).
+# File: .storage/oclean_ble_custom_programs
+PROGRAMS_STORAGE_KEY = f"{DOMAIN}_custom_programs"
+PROGRAMS_STORAGE_VERSION = 1
+
+# Dispatcher signal fired whenever the custom-programme store changes, so every
+# select entity refreshes its options + `programs` attribute.
+SIGNAL_PROGRAMS_UPDATED = f"{DOMAIN}_programs_updated"
+
+# Reserved pnum for "send/test without saving": below the custom range (>=120)
+# and above every preset, so a test write clobbers neither a preset nor a saved
+# custom programme.
+SCRATCH_PNUM = 119
+
+# Event fired once per newly imported brushing session (including backfilled
+# sessions with their historical timestamp). Payload: entry_id, mac,
+# device_name, ts, score, duration, duration_scheduled, pnum.
+EVENT_BRUSH_SESSION = "oclean_ble_brush_session"
 
 # BLE UUIDs
 OCLEAN_SERVICE_UUID = "8082caa8-41a6-4021-91c6-56f9b954cc18"
@@ -78,19 +101,36 @@ CONF_POLL_INTERVAL = "poll_interval"
 CONF_DEVICE_NAME = "device_name"
 CONF_POLL_WINDOWS = "poll_windows"  # str: "HH:MM-HH:MM[, HH:MM-HH:MM, ...]", "" = disabled
 CONF_POST_BRUSH_COOLDOWN = "post_brush_cooldown"  # int hours, 0 = disabled
+CONF_MERGE_WINDOW = "merge_window"  # int minutes (0-5), 0 = session merging disabled
 
 # Options-flow fields for the multi-step window setup (not persisted; combined into CONF_POLL_WINDOWS).
 CONF_WINDOW_COUNT = "window_count"  # int 0-3: how many poll windows the user wants
 CONF_WINDOW_START = "window_start"  # str "HH:MM:SS": start time in a per-window step
 CONF_WINDOW_END = "window_end"  # str "HH:MM:SS": end time in a per-window step
 DEFAULT_POST_BRUSH_COOLDOWN = 0
+DEFAULT_MERGE_WINDOW = 0
+
+CONF_ZONE_HISTORY = "zone_history_days"  # int days: 0 = disabled, -1 = unlimited, N = keep N days
+DEFAULT_ZONE_HISTORY = 0
 
 # Coordinator data keys
 DATA_BATTERY = "battery"
 DATA_LAST_BRUSH_SCORE = "last_brush_score"
 DATA_LAST_BRUSH_DURATION = "last_brush_duration"
+# Scheduled programme length of the last session (the record's bytes-7-8 field);
+# real brushed time lives in DATA_LAST_BRUSH_DURATION. Shown as sensor attribute.
+DATA_LAST_BRUSH_DURATION_SCHEDULED = "last_brush_duration_scheduled"
 DATA_LAST_BRUSH_PRESSURE = "last_brush_pressure"
 DATA_LAST_BRUSH_TIME = "last_brush_time"
+# Transient transport key: signed device→UTC offset in seconds, emitted only by
+# the 0308 paths (whose frame carries a real quarter-hour offset). The
+# coordinator consumes it to resolve last_brush_time to true UTC and then pops
+# it — it never becomes a sensor, attribute or stored value. See review P2.1.
+DATA_LAST_BRUSH_TZ_OFFSET_S = "last_brush_tz_offset_s"
+# Transient opt-out flag: set by a parse path whose last_brush_time is already a
+# true epoch (not a device-local wall-clock), so the coordinator must NOT apply
+# timezone resolution. The coordinator pops it. See review P2.1.
+DATA_LAST_BRUSH_TS_IS_UTC = "last_brush_ts_is_utc"
 
 # BLE connection timeout in seconds
 BLE_CONNECT_TIMEOUT = 10
@@ -120,6 +160,11 @@ BLE_SUBSCRIBE_RETRY_TIMEOUT = 5.0
 # Maximum total time for a single poll (connect → read → disconnect).
 # Prevents a hung GATT operation from blocking HA's event loop indefinitely.
 BLE_POLL_TOTAL_TIMEOUT = 60
+# Maximum total time for a single write action (connect → write → disconnect),
+# e.g. button presses or switch toggles.  Shorter than the poll ceiling because
+# actions transfer only a few bytes; still generous enough for 3 connect
+# attempts through a slow ESPHome proxy plus the post-connect delay.
+BLE_ACTION_TOTAL_TIMEOUT = 45
 # Timeout for a single write_gatt_char() call in the polling path.
 # Guards against BlueZ or ESPHome proxy hangs on individual write operations.
 BLE_WRITE_TIMEOUT = 5.0
@@ -169,6 +214,11 @@ DATA_DURATION_RATIO = "duration_ratio"  # int 0-100+: duration/240*100 (APK: Min
 # Coverage calculation threshold (APK: C2928q.java — raw_pressure * 4 > 400 → pressure > 100)
 COVERAGE_PRESSURE_THRESHOLD = 100
 
+# All-ones sentinel for the 0308-simple raw-pressure uint16 (bytes 16-17). The
+# firmware leaves unpopulated numeric fields at 0xFF/0xFFFF; without this guard
+# 0xFFFF / 300 would surface as a bogus 218.45 "pressure". See review P2.5.
+PRESSURE_RAW_SENTINEL = 0xFFFF
+
 # Per-zone coverage threshold for the gestureArray path (TYPE1 *B# records). This
 # reproduces the official app's on-device tooth-diagram logic, fully verified from
 # the APK — both the formula (C1793b.m3804z) and the i10 multiplier (smali: the
@@ -194,6 +244,13 @@ AREA_COVERAGE_NORM_THRESHOLD = 9
 # default 9 (Y3M/Y3/Y3P/Y3S map to non-Y3PD enum constants → < 9.0). The coordinator
 # passes this to the record parser when the DIS model ID is exactly "OCLEANY3PD".
 AREA_COVERAGE_Y3PD_THRESHOLD = 10
+
+# Models whose per-zone values are fixed-total time slots instead of seconds.
+# OCLEANY3MD (Oclean X): every session sums to exactly 96 = 8 zones × 12 slots
+# (à 2.5 s in the 4-min programme; matches getTime12() in the APK). For these
+# models the coordinator scales the zone values to real seconds before
+# emitting/storing them (zones_to_seconds).
+ZONE_SLOT_MODELS: frozenset[str] = frozenset({"OCLEANY3MD"})
 
 # Tooth area zone names in BrushAreaType enum order (value 1 → index 0 … value 8 → index 7)
 # Source: com/ocleanble/lib/device/BrushAreaType.java

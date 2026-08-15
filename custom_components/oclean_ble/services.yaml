@@ -12,3 +12,108 @@ poll:
       required: false
       selector:
         text:
+
+set_custom_scheme:
+  name: Set custom brush scheme
+  description: >
+    Write a user-defined brushing programme (arbitrary programme number and
+    step list) to the device. Each step is a gear (1-32 Clean, 33-36 Whitening,
+    37-40 Massage, 41 extended) and a duration in seconds (1-255).
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: The config entry ID of the target Oclean device.
+      required: true
+      selector:
+        text:
+    pnum:
+      name: Programme number
+      description: >
+        Programme slot (0-255). Overwriting an existing preset number is known
+        to work; a fresh number may or may not persist on the device.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+    steps:
+      name: Steps
+      description: >
+        Ordered list of 1-9 steps, each with a gear (1-41) and duration (1-255 s).
+        Ten or more steps exceed the BLE packet limit and are rejected.
+      required: true
+      selector:
+        object:
+
+save_custom_program:
+  name: Save custom programme
+  description: >
+    Create or overwrite a named custom brushing programme in the global,
+    cross-device store. It then appears in every device's Brush Scheme select.
+  fields:
+    name:
+      name: Name
+      description: Display name shown in the Brush Scheme dropdown.
+      required: true
+      selector:
+        text:
+    steps:
+      name: Steps
+      description: >
+        Ordered list of 1-9 steps, each with a gear (1-41 Clean/Whitening/
+        Massage) and a duration in seconds (1-255).
+      required: true
+      selector:
+        object:
+    pnum:
+      name: Programme number
+      description: >
+        Optional. Leave empty (or 0) to allocate a new slot (>= 120). Pass an
+        existing custom pnum (>= 120) to overwrite it in place.
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+
+delete_custom_program:
+  name: Delete custom programme
+  description: Remove a custom programme from the global store by its programme number.
+  fields:
+    pnum:
+      name: Programme number
+      description: The pnum (>= 120) of the custom programme to delete.
+      required: true
+      selector:
+        number:
+          min: 120
+          max: 255
+          mode: box
+
+get_zone_history:
+  name: Get zone history
+  description: Return the stored per-session zone history (8 per-zone seconds, duration, score) for one toothbrush, newest first. Requires the zone-history option to be enabled for the device.
+  fields:
+    entry_id:
+      name: Device
+      description: The Oclean config entry to query.
+      required: true
+      selector:
+        config_entry:
+          integration: oclean_ble
+    start:
+      name: Start
+      description: Only return sessions at or after this date/time.
+      required: false
+      example: "2026-06-01 00:00:00"
+      selector:
+        datetime:
+    end:
+      name: End
+      description: Only return sessions at or before this date/time.
+      required: false
+      example: "2026-07-01 00:00:00"
+      selector:
+        datetime:

@@ -6,7 +6,6 @@ import calendar
 import datetime
 import json
 import logging
-import time
 from collections.abc import Callable
 from typing import Any
 
@@ -20,6 +19,7 @@ from .const import (
     DATA_LAST_BRUSH_AREAS,
     DATA_LAST_BRUSH_COVERAGE,
     DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_DURATION_SCHEDULED,
     DATA_LAST_BRUSH_GESTURE_ARRAY,
     DATA_LAST_BRUSH_GESTURE_CODE,
     DATA_LAST_BRUSH_PNUM,
@@ -29,6 +29,9 @@ from .const import (
     DATA_LAST_BRUSH_PRESSURE_RATIO,
     DATA_LAST_BRUSH_SCORE,
     DATA_LAST_BRUSH_TIME,
+    DATA_LAST_BRUSH_TS_IS_UTC,
+    DATA_LAST_BRUSH_TZ_OFFSET_S,
+    PRESSURE_RAW_SENTINEL,
     RESP_BRUSH_AREAS_T1,
     RESP_BRUSH_AREAS_Y3P,
     RESP_DEVICE_INFO,
@@ -77,15 +80,37 @@ def _extract_nibbles(byte_val: int) -> list[int]:
     return [(byte_val >> (6 - 2 * i)) & 0x3 for i in range(4)]
 
 
-def _build_utc_timestamp(device_dt: datetime.datetime, tz_offset_quarters: int) -> int:
-    """Convert a device-local datetime and timezone offset to a UTC Unix timestamp.
+def _local_epoch(device_dt: datetime.datetime) -> int:
+    """Encode a device-local wall-clock datetime as a Unix epoch, host-independent.
+
+    The wall-clock digits are interpreted *as if UTC* (``calendar.timegm``), so
+    the result never depends on the host process timezone the way ``time.mktime``
+    would. This is a *device-local* epoch, NOT true UTC: the coordinator resolves
+    it to true UTC via :func:`resolve_session_utc` using either the frame's TZ
+    offset (0308 paths) or the HA-configured timezone. See review P2.1.
+    """
+    return int(calendar.timegm(device_dt.timetuple()))
+
+
+def resolve_session_utc(local_epoch: int, offset_s: int | None, tz: datetime.tzinfo) -> int:
+    """Resolve a device-local epoch (see :func:`_local_epoch`) to true UTC.
 
     Args:
-        device_dt: Device-local datetime (no tzinfo).
-        tz_offset_quarters: Signed offset from UTC in 15-minute steps.
+        local_epoch: Device wall-clock encoded as an epoch (digits treated as UTC).
+        offset_s: Signed device→UTC offset in seconds when the record carried one
+            (0308 paths); ``None`` for the offset-less paths.
+        tz: HA-configured timezone, consulted (DST-aware) only when *offset_s* is
+            ``None``.
+
+    Every parse path funnels through here so a session's timestamp is computed by
+    a single, host-independent convention regardless of which format produced it.
     """
-    utc_dt = device_dt - datetime.timedelta(minutes=tz_offset_quarters * 15)
-    return int(calendar.timegm(utc_dt.timetuple()))
+    if offset_s is not None:
+        return local_epoch - offset_s
+    # Reinterpret the wall-clock digits in the HA timezone and convert to UTC.
+    wallclock = datetime.datetime.fromtimestamp(local_epoch, tz=datetime.timezone.utc).replace(tzinfo=None)
+    aware = wallclock.replace(tzinfo=tz)
+    return int(aware.astimezone(datetime.timezone.utc).timestamp())
 
 
 def _build_area_stats(
@@ -295,7 +320,7 @@ def _parse_xx03_session_record(data: bytes) -> dict[str, Any]:
 
         month, day, hour, minute, second = data[10], data[11], data[12], data[13], data[14]
         device_dt = datetime.datetime(year, month, day, hour, minute, second)
-        timestamp_s = int(time.mktime(device_dt.timetuple()))
+        timestamp_s = _local_epoch(device_dt)
 
         result: dict[str, Any] = {
             DATA_LAST_BRUSH_TIME: timestamp_s,
@@ -306,9 +331,13 @@ def _parse_xx03_session_record(data: bytes) -> dict[str, Any]:
         if 0 < score <= 100:
             result[DATA_LAST_BRUSH_SCORE] = score
 
-        duration = (data[16] << 8) | data[17]
-        if duration > 0:
-            result[DATA_LAST_BRUSH_DURATION] = duration
+        # bytes 16-17 = scheduled programme length, bytes 18-19 = real brushed time
+        scheduled = (data[16] << 8) | data[17]
+        real = _real_duration_s(scheduled, (data[18] << 8) | data[19])
+        if real is not None:
+            result[DATA_LAST_BRUSH_DURATION] = real
+        if scheduled > 0:
+            result[DATA_LAST_BRUSH_DURATION_SCHEDULED] = scheduled
 
         _LOGGER.debug(
             "Oclean XX03 session record parsed: ts=%d score=%s pNum=%d duration=%s (raw: %s)",
@@ -417,6 +446,27 @@ def _parse_info_response(payload: bytes) -> dict[str, Any]:
     return {}
 
 
+def _real_duration_s(scheduled_s: int, valid_s: int) -> int | None:
+    """Return the real brushing seconds from a session record's duration pair.
+
+    Session records carry TWO duration fields: the SCHEDULED programme length
+    (constant per pnum) and validDuration = the actually-brushed seconds.
+    Verified live on OCLEANY3MH (2026-07-03): a 180 s programme aborted after
+    ~31 s stores scheduled=180, valid=31 — the sensor must report 31.
+
+    Prefers valid when plausible (0 < valid <= scheduled); falls back to the
+    scheduled value when the device leaves validDuration empty. Because the
+    real time can never exceed the scheduled time, this also self-corrects on
+    models that carry the two fields in swapped order: whichever field holds
+    the smaller non-zero value is the real one. Returns None when both are 0.
+    """
+    if valid_s > 0 and (scheduled_s == 0 or valid_s <= scheduled_s):
+        return valid_s
+    if scheduled_s > 0:
+        return scheduled_s
+    return None
+
+
 def _parse_m18f_record(record: bytes) -> dict[str, Any]:
     """Parse one full 42-byte m18f session record (paginated 0307 response).
 
@@ -430,8 +480,8 @@ def _parse_m18f_record(record: bytes) -> dict[str, Any]:
       byte  4:  minute
       byte  5:  second
       byte  6:  pNum              (brush-scheme ID)
-      bytes 7-8:  duration        (2-byte BE, total session seconds)
-      bytes 9-10: validDuration   (2-byte BE, not stored as sensor)
+      bytes 7-8:  duration        (2-byte BE, SCHEDULED programme seconds)
+      bytes 9-10: validDuration   (2-byte BE, REAL brushed seconds -> sensor)
       bytes 11-16: area1..area6   (tooth-area pressure bytes 1-6)
       byte 17:  reserved
       bytes 18-19: area7..area8   (tooth-area pressure bytes 7-8)
@@ -445,16 +495,19 @@ def _parse_m18f_record(record: bytes) -> dict[str, Any]:
 
     try:
         device_dt = _device_datetime(record[0], record[1], record[2], record[3], record[4], record[5])
-        timestamp_s = int(time.mktime(device_dt.timetuple()))
+        timestamp_s = _local_epoch(device_dt)
 
         result: dict[str, Any] = {
             DATA_LAST_BRUSH_TIME: timestamp_s,
             DATA_LAST_BRUSH_PNUM: int(record[6]),
         }
 
-        duration_s = (record[7] << 8) | record[8]
-        if duration_s > 0:
-            result[DATA_LAST_BRUSH_DURATION] = duration_s
+        scheduled_s = (record[7] << 8) | record[8]
+        real_s = _real_duration_s(scheduled_s, (record[9] << 8) | record[10])
+        if real_s is not None:
+            result[DATA_LAST_BRUSH_DURATION] = real_s
+        if scheduled_s > 0:
+            result[DATA_LAST_BRUSH_DURATION_SCHEDULED] = scheduled_s
 
         # Score at byte 33 (0xFF = no data)
         score = record[33]
@@ -527,8 +580,8 @@ def parse_t1_c3385w0_record(
       byte  4:   minute (0-59)                             ✓
       byte  5:   second (0-59)                             ✓
       byte  6:   pNum (brush-scheme ID)                    ✓
-      bytes 7-8: duration BE uint16 (seconds)              ✓
-      bytes 9-10: validDuration BE (not stored as sensor)  ✓
+      bytes 7-8: duration BE uint16 (SCHEDULED programme seconds) ✓
+      bytes 9-10: validDuration BE (REAL brushed seconds -> sensor) ✓ verified 2026-07-03
       bytes 11-15: pressureRatio[0..4] (5 pressure buckets) ✓ NOT tooth-zone areas
       byte 16:   discarded by APK (not an area byte)       ✓ APK L1620 result not assigned
       byte 17:   timezone index → getTimeZoneString()      ✓ APK L1638+L1812 (not stored)
@@ -573,20 +626,25 @@ def parse_t1_c3385w0_record(
 
         device_dt = datetime.datetime(year, month, day, hour, minute, second)
 
-        timestamp_s = int(time.mktime(device_dt.timetuple()))
+        timestamp_s = _local_epoch(device_dt)
         result: dict[str, Any] = {DATA_LAST_BRUSH_TIME: timestamp_s}
 
         result[DATA_LAST_BRUSH_PNUM] = int(record[6])
 
-        duration_s = (record[7] << 8) | record[8]
-        if duration_s > 0:
-            result[DATA_LAST_BRUSH_DURATION] = duration_s
+        # bytes 7-8 = scheduled programme length, bytes 9-10 = real brushed time
+        scheduled_s = (record[7] << 8) | record[8]
+        real_s = _real_duration_s(scheduled_s, (record[9] << 8) | record[10])
+        if real_s is not None:
+            result[DATA_LAST_BRUSH_DURATION] = real_s
+        if scheduled_s > 0:
+            result[DATA_LAST_BRUSH_DURATION_SCHEDULED] = scheduled_s
 
         score = record[33]
         if 0 < score <= 100:
             result[DATA_LAST_BRUSH_SCORE] = score
 
-        _apply_m18f_metrics(result, record, duration_s, coverage_norm_threshold)
+        # Coverage norm intentionally keeps the scheduled length (APK formula).
+        _apply_m18f_metrics(result, record, scheduled_s, coverage_norm_threshold)
 
         _LOGGER.debug(
             "Oclean C3385w0 record parsed: ts=%d pNum=%d duration=%s score=%s (raw: %s)",
@@ -672,23 +730,27 @@ def parse_t1_c3352g_record(
 
         device_dt = datetime.datetime(year, month, day, hour, minute, second)
 
-        timestamp_s = int(time.mktime(device_dt.timetuple()))
+        timestamp_s = _local_epoch(device_dt)
         result: dict[str, Any] = {DATA_LAST_BRUSH_TIME: timestamp_s}
 
         # pNum at byte 6 (uncertain offset – positional from C3385w0)
         result[DATA_LAST_BRUSH_PNUM] = int(record[6])
 
-        # Duration at bytes 7-8 BE (uncertain offset)
-        duration_s = (record[7] << 8) | record[8]
-        if duration_s > 0:
-            result[DATA_LAST_BRUSH_DURATION] = duration_s
+        # bytes 7-8 = scheduled programme length, bytes 9-10 = real brushed time
+        scheduled_s = (record[7] << 8) | record[8]
+        real_s = _real_duration_s(scheduled_s, (record[9] << 8) | record[10])
+        if real_s is not None:
+            result[DATA_LAST_BRUSH_DURATION] = real_s
+        if scheduled_s > 0:
+            result[DATA_LAST_BRUSH_DURATION_SCHEDULED] = scheduled_s
 
         # Score at byte 33 (confirmed APK: C3352g_fallback.java r57=byte[33])
         score = record[33]
         if 0 < score <= 100:
             result[DATA_LAST_BRUSH_SCORE] = score
 
-        _apply_m18f_metrics(result, record, duration_s, coverage_norm_threshold)
+        # Coverage norm intentionally keeps the scheduled length (APK formula).
+        _apply_m18f_metrics(result, record, scheduled_s, coverage_norm_threshold)
 
         _LOGGER.debug("Oclean C3352g record point=%d (raw byte 34, APK: not used)", record[34])
         _LOGGER.debug(
@@ -765,18 +827,25 @@ def parse_y3p_stream_record(
             year -= 1
             device_dt = datetime.datetime(year, month, day, hour, minute, second)
 
-        timestamp_s = int(time.mktime(device_dt.timetuple()))
+        timestamp_s = _local_epoch(device_dt)
         result: dict[str, Any] = {DATA_LAST_BRUSH_TIME: timestamp_s}
 
-        duration_s = (record[7] << 8) | record[8]
-        if duration_s > 0:
-            result[DATA_LAST_BRUSH_DURATION] = duration_s
+        # bytes 7-8 = scheduled programme length; bytes 9-10 = real brushed time
+        # (validDuration position unverified on Y3P — the plausibility guard in
+        # _real_duration_s falls back to bytes 7-8 when 9-10 is empty/implausible)
+        scheduled_s = (record[7] << 8) | record[8]
+        real_s = _real_duration_s(scheduled_s, (record[9] << 8) | record[10])
+        if real_s is not None:
+            result[DATA_LAST_BRUSH_DURATION] = real_s
+        if scheduled_s > 0:
+            result[DATA_LAST_BRUSH_DURATION_SCHEDULED] = scheduled_s
 
         score = record[33]
         if 0 < score <= 100:
             result[DATA_LAST_BRUSH_SCORE] = score
 
-        _apply_m18f_metrics(result, record, duration_s, coverage_norm_threshold)
+        # Coverage norm intentionally keeps the scheduled length (APK formula).
+        _apply_m18f_metrics(result, record, scheduled_s, coverage_norm_threshold)
 
         _LOGGER.debug("Oclean Y3P stream record point=%d (raw byte 34, APK: not used)", record[34])
         _LOGGER.debug(
@@ -812,7 +881,7 @@ def _parse_t1_ocleanx20_inline(payload: bytes) -> dict[str, Any]:
         return {}
     try:
         device_dt = _device_datetime(payload[9], payload[10], payload[11], payload[12], payload[13], payload[14])
-        timestamp_s = int(time.mktime(device_dt.timetuple()))
+        timestamp_s = _local_epoch(device_dt)
         result: dict[str, Any] = {
             DATA_LAST_BRUSH_TIME: timestamp_s,
             DATA_LAST_BRUSH_PNUM: int(payload[15]),
@@ -910,7 +979,7 @@ def _parse_info_t1_response(payload: bytes) -> dict[str, Any]:
     # Inline mode (session_count == 0): truncated 13-byte record, no score
     try:
         device_dt = _device_datetime(payload[5], payload[6], payload[7], payload[8], payload[9], payload[10])
-        timestamp_s = int(time.mktime(device_dt.timetuple()))
+        timestamp_s = _local_epoch(device_dt)
 
         result = {
             DATA_LAST_BRUSH_TIME: timestamp_s,
@@ -955,16 +1024,18 @@ def _parse_running_data_record(data: bytes) -> dict[str, Any]:
         blunt_teeth = int.from_bytes(data[14:16], byteorder="little")
 
         # bytes 16–17: pressure raw (little-endian uint16) / 300
+        # 0xFFFF is the "field not populated" sentinel (analogous to the 0xFF
+        # score sentinel); reporting it as 218.45 would be bogus, so omit the
+        # pressure field entirely in that case (review P2.5).
         pressure_raw = int.from_bytes(data[16:18], byteorder="little")
-        pressure = round(pressure_raw / 300, 2)
-
-        timestamp_s = _build_utc_timestamp(device_dt, tz_offset_quarters)
 
         result: dict[str, Any] = {
-            DATA_LAST_BRUSH_TIME: timestamp_s,
-            DATA_LAST_BRUSH_PRESSURE: pressure,
+            DATA_LAST_BRUSH_TIME: _local_epoch(device_dt),
+            DATA_LAST_BRUSH_TZ_OFFSET_S: tz_offset_quarters * 900,
             DATA_BRUSH_HEAD_USAGE: blunt_teeth,
         }
+        if pressure_raw != PRESSURE_RAW_SENTINEL:
+            result[DATA_LAST_BRUSH_PRESSURE] = round(pressure_raw / 300, 2)
         _LOGGER.debug(
             "Oclean 0308-simple parsed: %s (blunt_teeth=%d, pNum=%d, week=%d)",
             result,
@@ -1023,16 +1094,18 @@ def _parse_extended_running_data_record(data: bytes) -> dict[str, Any]:
     try:
         device_dt = _device_datetime(data[2], data[3], data[4], data[5], data[6], data[7])
         p_num = int(data[8])
-        duration = int.from_bytes(data[9:11], byteorder="big")
+        # bytes 9-10 = scheduled programme length, bytes 11-12 = real brushed time
+        scheduled = int.from_bytes(data[9:11], byteorder="big")
+        duration = _real_duration_s(scheduled, int.from_bytes(data[11:13], byteorder="big")) or 0
         # data[13:18]: 5 intermediate pressure zone values (not mapped to sensors)
         tz_offset_quarters = _parse_signed_byte(data[19])
         area_pressures = data[20:28]  # 8 tooth area pressure bytes
         score = int(data[28])
-        timestamp_s = _build_utc_timestamp(device_dt, tz_offset_quarters)
         area_dict, zones_cleaned, avg_pressure, coverage_pct = _build_area_stats(area_pressures)
 
         result: dict[str, Any] = {
-            DATA_LAST_BRUSH_TIME: timestamp_s,
+            DATA_LAST_BRUSH_TIME: _local_epoch(device_dt),
+            DATA_LAST_BRUSH_TZ_OFFSET_S: tz_offset_quarters * 900,
             DATA_LAST_BRUSH_DURATION: duration,
             DATA_LAST_BRUSH_SCORE: max(0, min(100, score)),
             DATA_LAST_BRUSH_PRESSURE: avg_pressure,
@@ -1040,6 +1113,8 @@ def _parse_extended_running_data_record(data: bytes) -> dict[str, Any]:
             DATA_LAST_BRUSH_COVERAGE: coverage_pct,
             DATA_LAST_BRUSH_PNUM: p_num,
         }
+        if scheduled > 0:
+            result[DATA_LAST_BRUSH_DURATION_SCHEDULED] = scheduled
 
         _LOGGER.debug(
             "Oclean extended running-data: ts=%d score=%d duration=%ds pNum=%d zones_cleaned=%d/8 coverage=%d%% avg_pressure=%d",
@@ -1229,7 +1304,7 @@ def _parse_session_meta_t1_response(payload: bytes) -> dict[str, Any]:
             payload[11],
             payload[12],
         )
-        timestamp_s = int(time.mktime(device_dt.timetuple()))
+        timestamp_s = _local_epoch(device_dt)
         duration = payload[15]
         _LOGGER.debug(
             "Oclean 5a00 session: date=%s ts=%d duration=%ds b13=0x%02x b16=0x%02x (raw: %s)",
@@ -1465,7 +1540,7 @@ def _parse_session_meta_y3p_response(payload: bytes) -> dict[str, Any]:
             year -= 1
             device_dt = datetime.datetime(year, month, day, hour, minute, second)
 
-        timestamp_s = int(time.mktime(device_dt.timetuple()))
+        timestamp_s = _local_epoch(device_dt)
         duration = payload[15]
 
         _LOGGER.debug(
@@ -1529,9 +1604,29 @@ def _map_json_brush_data(data: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for result_key, candidates, cast_int in _JSON_KEY_MAP:
         for key in candidates:
-            if key in data:
-                result[result_key] = int(data[key]) if cast_int else data[key]
-                break
+            if key not in data:
+                continue
+            value = data[key]
+            if cast_int:
+                # The device (or BLE proxy) may send a non-numeric value
+                # (e.g. "n/a", null, or a nested object). Skip the field
+                # instead of letting int() raise out of parse_notification().
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    _LOGGER.debug(
+                        "Oclean JSON field %r has non-integer value %r – skipped",
+                        key,
+                        value,
+                    )
+                    break
+            result[result_key] = value
+            break
+    # The JSON timestamp fields (endTime/timestamp/…) are already epoch-like, not
+    # a device-local wall-clock, so opt out of the coordinator's timezone
+    # resolution to preserve the historical raw-value behaviour (review P2.1).
+    if DATA_LAST_BRUSH_TIME in result:
+        result[DATA_LAST_BRUSH_TS_IS_UTC] = True
     if result:
         _LOGGER.debug("Oclean brush session data mapped: %s", result)
     else:

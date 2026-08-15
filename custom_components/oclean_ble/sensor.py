@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from typing import Any
 
@@ -11,9 +12,15 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
+from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
-from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    EntityCategory,
+    UnitOfTime,
+)
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -28,6 +35,7 @@ from .const import (
     DATA_LAST_BRUSH_AREAS,
     DATA_LAST_BRUSH_COVERAGE,
     DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_DURATION_SCHEDULED,
     DATA_LAST_BRUSH_GESTURE_ARRAY,
     DATA_LAST_BRUSH_GESTURE_CODE,
     DATA_LAST_BRUSH_PNUM,
@@ -101,15 +109,8 @@ SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
         # Primary sensor (not diagnostic): coverage is a user-facing brushing-quality
         # metric alongside the score. 0–100 %: covered zones / 8 (per-zone share-based).
     ),
-    SensorEntityDescription(
-        key=DATA_LAST_BRUSH_DURATION,
-        translation_key=DATA_LAST_BRUSH_DURATION,
-        device_class=SensorDeviceClass.DURATION,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfTime.SECONDS,
-        suggested_unit_of_measurement=UnitOfTime.MINUTES,
-        icon="mdi:timer",
-    ),
+    # NOTE: DATA_LAST_BRUSH_DURATION is handled by OcleanDurationSensor below
+    # (same description/unique_id, adds the scheduled programme length attribute).
     SensorEntityDescription(
         key=DATA_LAST_BRUSH_PRESSURE,
         translation_key=DATA_LAST_BRUSH_PRESSURE,
@@ -201,6 +202,18 @@ SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
     # NOTE: Duration Rating, Pressure Detail, and Power Distribution are custom sensors below.
 )
 
+# Description for the duration sensor (instantiated as OcleanDurationSensor so it
+# can expose the scheduled programme length as an attribute).
+_DURATION_DESCRIPTION = SensorEntityDescription(
+    key=DATA_LAST_BRUSH_DURATION,
+    translation_key=DATA_LAST_BRUSH_DURATION,
+    device_class=SensorDeviceClass.DURATION,
+    state_class=SensorStateClass.MEASUREMENT,
+    native_unit_of_measurement=UnitOfTime.SECONDS,
+    suggested_unit_of_measurement=UnitOfTime.MINUTES,
+    icon="mdi:timer",
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -219,6 +232,11 @@ async def async_setup_entry(
     entities.append(OcleanSchemeSensor(coordinator, mac, device_name))
     entities.extend(OcleanToothAreaSensor(coordinator, mac, device_name, zone_name) for zone_name in TOOTH_AREA_NAMES)
     entities.append(OcleanMacSensor(coordinator, mac, device_name))
+    entities.append(OcleanDurationSensor(coordinator, mac, device_name))
+    entities.append(OcleanRssiSensor(coordinator, mac, device_name))
+    if coordinator.merge_enabled:
+        entities.append(OcleanGroupScoreSensor(coordinator, mac, device_name))
+        entities.append(OcleanGroupDurationSensor(coordinator, mac, device_name))
     entities.append(OcleanDurationRatingSensor(coordinator, mac, device_name))
     entities.append(OcleanPressureDetailSensor(coordinator, mac, device_name))
     entities.append(OcleanPowerDistributionSensor(coordinator, mac, device_name))
@@ -340,11 +358,24 @@ class OcleanSchemeSensor(OcleanEntity, SensorEntity):
 
     @property
     def native_value(self) -> str | None:
-        """Return scheme name, or pNum as string if not in lookup table."""
+        """Return the scheme name with its pNum in parentheses.
+
+        Resolves the name from the global custom-programme store first (so custom
+        programmes >= 120 show their user-given name), then the built-in preset
+        lookup. Falls back to the bare pNum when the name is unknown.
+        """
         pnum = self._get_pnum()
         if pnum is None:
             return None
-        return SCHEME_NAMES.get(pnum, str(pnum))
+        name = None
+        store = self.hass.data.get(DOMAIN, {}).get("_programs")
+        if store is not None:
+            entry = store.get(pnum)
+            if entry is not None:
+                name = entry["name"]
+        if name is None:
+            name = SCHEME_NAMES.get(pnum)
+        return f"{name} ({pnum})" if name else str(pnum)
 
     @property
     def available(self) -> bool:
@@ -535,3 +566,172 @@ class OcleanMacSensor(OcleanEntity, SensorEntity):
     @property
     def available(self) -> bool:
         return True
+
+
+class OcleanDurationSensor(OcleanSensor):
+    """Duration sensor whose state is the REAL brushed time of the last session.
+
+    Session records carry two durations: the scheduled programme length and the
+    actually-brushed seconds (validDuration). The state holds the real time; the
+    scheduled length is exposed as the `scheduled_duration_s` attribute so
+    dashboards can render e.g. "31 s of 3:00 min".
+    """
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, _DURATION_DESCRIPTION, mac, device_name)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.coordinator.data is None:
+            return None
+        scheduled = self.coordinator.data.get(DATA_LAST_BRUSH_DURATION_SCHEDULED)
+        return {"scheduled_duration_s": scheduled} if scheduled is not None else None
+
+
+class OcleanGroupScoreSensor(OcleanEntity, SensorEntity):
+    """Integration-computed score for a group of back-to-back sessions.
+
+    When the merge window (options flow) is > 0, back-to-back runs form a
+    group; the state is min(100, sum of the firmware scores) — two half
+    brushings of 50 % + 60 % count as one full 100 % brushing. Attributes
+    expose the individual firmware scores for internal-vs-external comparison.
+    """
+
+    _attr_translation_key = "group_score"
+    _attr_icon = "mdi:star-check"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, "group_score")
+
+    @property
+    def native_value(self) -> int | None:
+        return self.coordinator.group_score
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        return self.coordinator.group_info
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.merge_enabled
+
+
+class OcleanGroupDurationSensor(OcleanEntity, SensorEntity):
+    """Total real brushing time of the current back-to-back session group."""
+
+    _attr_translation_key = "group_duration"
+    _attr_icon = "mdi:timer-plus"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    _attr_suggested_unit_of_measurement = UnitOfTime.MINUTES
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, "group_duration")
+
+    @property
+    def native_value(self) -> int | None:
+        return self.coordinator.group_duration
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.merge_enabled
+
+
+class OcleanRssiSensor(OcleanEntity, SensorEntity):
+    """Diagnostic sensor exposing the latest advertisement RSSI (signal strength).
+
+    Read live from Home Assistant's Bluetooth registry (local adapter or ESPHome
+    proxy) rather than from a BLE poll, so the value is available even between
+    polls. Home Assistant already keeps the strongest recent advertisement across
+    all scanners, so the state reflects the best-reachable proxy.
+
+    Updates are event-driven: a passive Bluetooth callback refreshes the entity on
+    every advertisement (no GATT connection, no extra battery cost — the brush
+    broadcasts these anyway) in addition to coordinator updates. Attributes expose
+    the chosen source proxy and the per-proxy RSSI, which is useful for placing a
+    proxy and diagnosing weak-signal issues.
+    """
+
+    _attr_translation_key = "rssi"
+    _attr_icon = "mdi:bluetooth-audio"
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, "rssi")
+
+    async def async_added_to_hass(self) -> None:
+        """Refresh live on every advertisement for this device (passive listen)."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            bluetooth.async_register_callback(
+                self.hass,
+                self._advertisement_callback,
+                bluetooth.BluetoothCallbackMatcher(address=self._mac, connectable=False),
+                bluetooth.BluetoothScanningMode.PASSIVE,
+            )
+        )
+
+    @callback
+    def _advertisement_callback(self, service_info: Any, change: Any) -> None:
+        """Push a fresh state whenever a new advertisement arrives."""
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the strongest recent advertisement RSSI, or None if unknown."""
+        service_info = bluetooth.async_last_service_info(self.hass, self._mac, connectable=False)
+        return service_info.rssi if service_info is not None else None
+
+    def _scanner_age_s(self, scanner: Any) -> int | None:
+        """Seconds since *scanner* last heard this MAC, or None if unavailable.
+
+        Uses the scanner's per-device timestamp map (monotonic). Prefers the public
+        ``discovered_device_timestamps`` property; the underscore-prefixed name is
+        only a fallback for habluetooth versions predating it (it emits a
+        FutureWarning on newer ones). Guarded with getattr so an API change on
+        either side only drops the age, never errors.
+        """
+        ts_map = getattr(scanner, "discovered_device_timestamps", None)
+        if not isinstance(ts_map, dict):
+            ts_map = getattr(scanner, "_discovered_device_timestamps", None)
+        if not isinstance(ts_map, dict):
+            return None
+        ts = ts_map.get(self._mac) or ts_map.get(self._mac.upper())
+        if ts is None:
+            return None
+        return max(0, int(time.monotonic() - ts))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose the chosen source proxy and the RSSI + age seen by each proxy.
+
+        HA picks the source by freshness (with a small RSSI hysteresis), not by
+        strongest signal alone — so a fresh weaker advertisement can outrank a
+        stale stronger one. The per-proxy age makes that visible: a strong reading
+        with a large age is stale and explains why another proxy is the source.
+        """
+        attrs: dict[str, Any] = {}
+        info = bluetooth.async_last_service_info(self.hass, self._mac, connectable=False)
+        if info is not None:
+            attrs["source"] = info.source
+        by_scanner: dict[str, str] = {}
+        for device in bluetooth.async_scanner_devices_by_address(self.hass, self._mac, connectable=False):
+            adv = device.advertisement
+            if adv is None or adv.rssi is None:
+                continue
+            name = getattr(device.scanner, "name", None) or getattr(device.scanner, "source", "?")
+            age = self._scanner_age_s(device.scanner)
+            by_scanner[name] = f"{adv.rssi} dBm" + (f" (vor {age} s)" if age is not None else "")
+        if by_scanner:
+            attrs["by_scanner"] = by_scanner
+        return attrs or None
+
+    @property
+    def available(self) -> bool:
+        """Available whenever an advertisement has been seen for this MAC."""
+        return bluetooth.async_last_service_info(self.hass, self._mac, connectable=False) is not None

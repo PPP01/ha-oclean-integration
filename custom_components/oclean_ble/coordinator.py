@@ -10,7 +10,7 @@ import logging
 import struct
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import time as _dtime
 from datetime import timedelta
 from typing import Any
@@ -23,11 +23,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
+from .ble_utils import is_genuine_cancellation, is_reassembly_continuation, normalize_char_source
 from .const import (
     AREA_COVERAGE_NORM_THRESHOLD,
     AREA_COVERAGE_Y3PD_THRESHOLD,
     BATTERY_CHAR_UUID,
+    BLE_ACTION_TOTAL_TIMEOUT,
     BLE_ENRICHMENT_WAIT,
     BLE_NOTIFICATION_WAIT,
     BLE_NOTIFICATION_WAIT_NO_SUB,
@@ -57,6 +60,7 @@ from .const import (
     DATA_LAST_BRUSH_AREAS,
     DATA_LAST_BRUSH_COVERAGE,
     DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_DURATION_SCHEDULED,
     DATA_LAST_BRUSH_GESTURE_ARRAY,
     DATA_LAST_BRUSH_GESTURE_CODE,
     DATA_LAST_BRUSH_PNUM,
@@ -66,6 +70,8 @@ from .const import (
     DATA_LAST_BRUSH_PRESSURE_RATIO,
     DATA_LAST_BRUSH_SCORE,
     DATA_LAST_BRUSH_TIME,
+    DATA_LAST_BRUSH_TS_IS_UTC,
+    DATA_LAST_BRUSH_TZ_OFFSET_S,
     DATA_LAST_POLL,
     DATA_MODEL_ID,
     DATA_SW_VERSION,
@@ -73,13 +79,16 @@ from .const import (
     DIS_MODEL_UUID,
     DIS_SW_REV_UUID,
     DOMAIN,
+    EVENT_BRUSH_SESSION,
     MAX_SESSION_PAGES,
     OCLEANY3M_SCHEMES,
     READ_NOTIFY_CHAR_UUID,
     RECEIVE_BRUSH_UUID,
     SCHEMES_BY_MODEL,
     STORAGE_VERSION,
+    TOOTH_AREA_NAMES,
     WRITE_CHAR_UUID,
+    ZONE_SLOT_MODELS,
 )
 from .models import OcleanDeviceData
 from .parser import (
@@ -89,9 +98,19 @@ from .parser import (
     parse_t1_c3352g_record,
     parse_t1_c3385w0_record,
     parse_y3p_stream_record,
+    resolve_session_utc,
 )
+from .program_utils import validate_program_steps
 from .protocol import UNKNOWN, DeviceProtocol, is_known_model, protocol_for_model
+from .session_group import combined_score, extend_group, is_group_continuation, new_group
+from .session_guard import (
+    FUTURE_TOLERANCE_S,
+    filter_plausible_history,
+    is_plausible_session_ts,
+    sanitize_last_session_ts,
+)
 from .statistics import import_new_sessions
+from .zone_utils import zone_emoji_signature, zones_to_seconds
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -290,6 +309,7 @@ _PERSISTENT_KEYS = (
     DATA_BRUSH_HEAD_USAGE,
     DATA_LAST_BRUSH_SCORE,
     DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_DURATION_SCHEDULED,
     DATA_LAST_BRUSH_PRESSURE,
     DATA_LAST_BRUSH_TIME,
     DATA_LAST_BRUSH_AREAS,
@@ -316,6 +336,7 @@ _SESSION_SNAPSHOT_KEYS: tuple[str, ...] = (
     DATA_LAST_BRUSH_TIME,
     DATA_LAST_BRUSH_PNUM,
     DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_DURATION_SCHEDULED,
     DATA_LAST_BRUSH_SCORE,
     DATA_LAST_BRUSH_AREAS,
     DATA_LAST_BRUSH_COVERAGE,
@@ -389,6 +410,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         update_interval: int,
         poll_windows: str = "",
         post_brush_cooldown_h: int = 0,
+        merge_window_min: int = 0,
+        zone_history_days: int = 0,
     ) -> None:
         super().__init__(
             hass,
@@ -447,6 +470,23 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         # Unix timestamp until which polls are suppressed after a new session.
         self._cooldown_until: float = 0.0
 
+        # Back-to-back session merging (0 = off). Groups sessions whose gap to
+        # the previous session's end is <= the window; the integration computes
+        # its own capped-sum score per group (see session_group.py). The group
+        # state is persisted so merging works across polls and HA restarts.
+        self._merge_window_s: int = max(0, int(merge_window_min)) * 60
+        self._session_group: dict[str, Any] | None = None
+
+        # Per-session zone history (opt-in): 0 = disabled, -1 = unlimited,
+        # N = keep N days. Entries {ts, zones, duration, score, pnum}, ascending.
+        self._zone_history_days: int = int(zone_history_days)
+        self._zone_history: list[dict[str, Any]] = []
+
+        # Set by async_poll_now(): the next update bypasses window/cooldown
+        # gating – smart-polling restrictions target SCHEDULED polls, an
+        # explicit user action must always attempt a connection.
+        self._force_poll_once: bool = False
+
     # ------------------------------------------------------------------
     # DataUpdateCoordinator interface
     # ------------------------------------------------------------------
@@ -462,7 +502,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         # Exception: always poll when no cached data exists so that the initial
         # setup (or first poll after a restart with no persisted store) completes
         # regardless of configured windows.
-        skip_reason = self._poll_skip_reason()
+        skip_reason = None if self._force_poll_once else self._poll_skip_reason()
         if skip_reason and self._last_raw:
             self._log.debug("poll skipped: %s", skip_reason)
             return OcleanDeviceData.from_dict(self._last_raw)
@@ -475,6 +515,23 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         try:
             raw = await self._poll_device()
             return OcleanDeviceData.from_dict(raw)
+        except asyncio.CancelledError as err:
+            # The ESPHome BLE-proxy connect path leaks a *spurious* CancelledError
+            # when a connection to a sleeping device times out (its internal
+            # disconnect-guard cancels an await). CancelledError is a
+            # BaseException, so the `except Exception` below never catches it and
+            # it would otherwise abort async_setup_entry ("config entry cancelled").
+            # A *genuine* task cancellation (HA shutdown / entry reload) sets
+            # current_task().cancelling() > 0 and MUST propagate – only translate
+            # the spurious proxy cancellation into a retryable UpdateFailed.
+            task = asyncio.current_task()
+            if is_genuine_cancellation(task.cancelling() if task is not None else 0):
+                raise
+            self._log.debug("poll cancelled by BLE proxy (device likely asleep): %s", err)
+            self.last_poll_successful = False
+            if self._last_raw:
+                return OcleanDeviceData.from_dict(self._last_raw)
+            raise UpdateFailed(f"Oclean device not reachable (proxy cancelled): {err}") from err
         except Exception as err:
             # Catch all exceptions (BleakError, TimeoutError, IndexError from
             # habluetooth proxy backend, etc.) so HA can keep retrying rather
@@ -495,14 +552,53 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
     # Public API for button entities
     # ------------------------------------------------------------------
 
-    async def async_reset_brush_head(self) -> None:
-        """Connect to the device and send CMD_CLEAR_BRUSH_HEAD (020F).
+    async def _run_ble_action(
+        self,
+        description: str,
+        action: Callable[[BleakClient], Awaitable[None]],
+    ) -> None:
+        """Run *action* against a freshly connected client, fully protected.
 
-        Subscribes to response characteristics before sending the command so
-        any ACK notification is captured and logged for protocol research.
-        Called by the "Reset Brush Head" button entity.
-        Raises BleakError if the device cannot be reached.
+        Mirrors the safeguards of the poll path (_async_update_data /
+        _poll_device) for the write-action entities (buttons, switches,
+        numbers, selects), which previously shared the leaking
+        establish_connection path WITHOUT its protections:
+
+        * one total ``asyncio.wait_for`` ceiling over connect + action +
+          disconnect, so a hung GATT operation can never stall an entity
+          action indefinitely,
+        * the spurious ``CancelledError`` leaked by the ESPHome BLE-proxy
+          connect path (see _async_update_data) is translated into a
+          ``BleakError`` – a genuine task cancellation still propagates,
+        * the client is always disconnected via ``finally``.
+
+        Raises BleakError if the device cannot be reached, matching the
+        documented behaviour of all public write methods.
         """
+        try:
+            await asyncio.wait_for(
+                self._connect_and_run(action),
+                timeout=BLE_ACTION_TOTAL_TIMEOUT,
+            )
+        except asyncio.CancelledError as err:
+            task = asyncio.current_task()
+            if is_genuine_cancellation(task.cancelling() if task is not None else 0):
+                raise
+            self._log.debug(
+                "%s cancelled by BLE proxy (device likely asleep): %s",
+                description,
+                err,
+            )
+            raise BleakError(
+                f"device not reachable (proxy cancelled during {description})"
+            ) from err
+        except TimeoutError as err:
+            raise BleakError(
+                f"{description} timed out after {BLE_ACTION_TOTAL_TIMEOUT}s"
+            ) from err
+
+    async def _connect_and_run(self, action: Callable[[BleakClient], Awaitable[None]]) -> None:
+        """Connect, wait for the GATT table, run *action*, always disconnect."""
         ble_device = self._resolve_ble_device()
         client = await establish_connection(
             BleakClient,
@@ -512,7 +608,21 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         )
         try:
             await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+            await action(client)
+        finally:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
 
+    async def async_reset_brush_head(self) -> None:
+        """Connect to the device and send CMD_CLEAR_BRUSH_HEAD (020F).
+
+        Subscribes to response characteristics before sending the command so
+        any ACK notification is captured and logged for protocol research.
+        Called by the "Reset Brush Head" button entity.
+        Raises BleakError if the device cannot be reached.
+        """
+
+        async def _action(client: BleakClient) -> None:
             def _ack_handler(_sender: Any, raw: bytearray) -> None:
                 data = bytes(raw)
                 parsed = parse_notification(data)
@@ -537,9 +647,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             for char_uuid in subscribed_ack:
                 with contextlib.suppress(Exception):
                     await client.stop_notify(char_uuid)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("reset brush head", _action)
 
         self._brush_head_sw_count = 0
         await self._save_store()
@@ -552,15 +661,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the "Sync Time" button entity.
         Raises BleakError if the device cannot be reached.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             subscribed: list[str] = []
             for char_uuid in self._protocol.notify_chars:
                 try:
@@ -572,9 +674,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             for char_uuid in subscribed:
                 with contextlib.suppress(Exception):
                     await client.stop_notify(char_uuid)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("sync time", _action)
 
     @property
     def area_remind(self) -> bool | None:
@@ -607,21 +708,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the Area Reminder switch entity.  State is persisted so the
         switch shows the correct value after HA restarts.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
         cmd = CMD_AREA_REMIND + bytes([0x01 if enabled else 0x00])
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             await self._write_standalone(client, cmd)
             self._log.info("area remind set to %s", enabled)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("area remind write", _action)
         self._area_remind = enabled
         await self._save_store()
 
@@ -631,21 +724,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the Over-Pressure Alert switch entity.  State is persisted so
         the switch shows the correct value after HA restarts.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
         cmd = CMD_OVER_PRESSURE + bytes([0x01 if enabled else 0x00])
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             await self._write_standalone(client, cmd)
             self._log.info("over pressure set to %s", enabled)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("over pressure write", _action)
         self._over_pressure = enabled
         await self._save_store()
 
@@ -655,21 +740,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the Brushing Reminder switch entity.  State is persisted so
         the switch shows the correct value after HA restarts.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
         cmd = CMD_REMIND_SWITCH + bytes([0x01 if enabled else 0x00])
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             await self._write_standalone(client, cmd)
             self._log.info("remind switch set to %s", enabled)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("remind switch write", _action)
         self._remind_switch = enabled
         await self._save_store()
 
@@ -679,21 +756,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the Auto Power-Off Timer switch entity.  State is persisted so
         the switch shows the correct value after HA restarts.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
         cmd = CMD_RUNNING_SWITCH + bytes([0x01 if enabled else 0x00])
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             await self._write_standalone(client, cmd)
             self._log.info("running switch set to %s", enabled)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("running switch write", _action)
         self._running_switch = enabled
         await self._save_store()
 
@@ -703,21 +772,13 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         Called by the Brush Head Max Lifetime number entity.  State is persisted
         so the number shows the correct value after HA restarts.
         """
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
         cmd = CMD_BRUSH_HEAD_MAX_DAYS + days.to_bytes(2, "big")
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
+
+        async def _action(client: BleakClient) -> None:
             await self._write_standalone(client, cmd)
             self._log.info("brush head max days set to %d", days)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("brush head max days write", _action)
         self._brush_head_max_days = days
         await self._save_store()
 
@@ -726,13 +787,52 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         """Return the pnum of the last-applied brush scheme, or None if never set."""
         return self._active_scheme_pnum
 
-    async def async_set_brush_scheme(self, pnum: int) -> None:
-        """Connect and send the SetBrushScheme command (0206) to the device.
+    # ------------------------------------------------------------------
+    # Back-to-back session group (integration-computed values)
+    # ------------------------------------------------------------------
 
-        Builds the BLE packet following APK AbstractC0002b.m28p() and sends it
-        via the device's write characteristic.  For schemes with more than 4 steps
-        the payload exceeds 20 bytes and is split into two GATT writes.
-        Called by the Brush Scheme select entity.
+    @property
+    def merge_enabled(self) -> bool:
+        """True when back-to-back session merging is configured (> 0 min)."""
+        return self._merge_window_s > 0
+
+    @property
+    def group_score(self) -> int | None:
+        """Integration score of the current group: min(100, sum of run scores)."""
+        if not self._session_group:
+            return None
+        return combined_score(self._session_group["scores"])
+
+    @property
+    def group_duration(self) -> int | None:
+        """Total real brushing seconds of the current group."""
+        if not self._session_group:
+            return None
+        return sum(self._session_group["durations"])
+
+    @property
+    def group_info(self) -> dict[str, Any] | None:
+        """Attribute payload for the group sensors (runs, scores, start)."""
+        if not self._session_group:
+            return None
+        scores = self._session_group["scores"]
+        return {
+            "sessions": len(scores),
+            "einzel_scores": scores,
+            "firmware_score_letzte": next((s for s in reversed(scores) if s is not None), None),
+            "start_ts": self._session_group.get("start_ts"),
+        }
+
+    @property
+    def zone_history(self) -> list[dict[str, Any]]:
+        """Per-session zone history (ascending by ts)."""
+        return list(self._zone_history)
+
+    async def async_set_brush_scheme(self, pnum: int) -> None:
+        """Connect and send a preset SetBrushScheme command (0206) to the device.
+
+        Looks up the preset steps for *pnum* from the model's scheme dict and
+        writes them.  Called by the Brush Scheme select entity.
         Raises ValueError for unknown pnums, BleakError on connection failure.
         """
         model_id = self.data.model_id if self.data else None
@@ -741,18 +841,31 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         if scheme is None:
             raise ValueError(f"Unknown scheme pnum {pnum} for model {model_id}")
         name, steps = scheme
+        await self._async_write_scheme(pnum, name, steps)
+
+    async def async_set_custom_scheme(self, pnum: int, steps: list[tuple[int, int]]) -> None:
+        """Send a user-defined brush scheme (arbitrary pnum + step list).
+
+        Unlike async_set_brush_scheme this does NOT require *pnum* to exist in a
+        preset dict — it writes whatever (gear, duration) steps are given, which
+        is what enables custom programmes.  Validates ranges and the 1-9 step
+        ceiling.  Raises ValueError on invalid input, BleakError on connection
+        failure.
+        """
+        validate_program_steps(steps)
+        await self._async_write_scheme(pnum, f"custom-{pnum}", steps)
+
+    async def _async_write_scheme(self, pnum: int, name: str, steps: list[tuple[int, int]]) -> None:
+        """Build the 0206 SetBrushScheme packet(s) for *steps* and write them.
+
+        Follows APK AbstractC0002b.m28p(); payloads over 20 bytes are split into
+        two GATT writes.  Subscribes to the notify chars first so any ACK is
+        logged, and waits briefly after the write so the device commits the
+        command before the connection drops.
+        """
         packets = _build_scheme_packets(pnum, steps)
 
-        ble_device = self._resolve_ble_device()
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self._device_name,
-            max_attempts=3,
-        )
-        try:
-            await asyncio.sleep(BLE_POST_CONNECT_DELAY)
-
+        async def _action(client: BleakClient) -> None:
             def _ack_handler(_sender: Any, raw: bytearray) -> None:
                 data = bytes(raw)
                 parsed = parse_notification(data)
@@ -788,9 +901,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             for char_uuid in subscribed:
                 with contextlib.suppress(Exception):
                     await client.stop_notify(char_uuid)
-        finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+
+        await self._run_ble_action("brush scheme write", _action)
         self._active_scheme_pnum = pnum
         await self._save_store()
 
@@ -837,6 +949,18 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
 
         return None
 
+    async def async_poll_now(self) -> None:
+        """User-requested poll: bypass window/cooldown restrictions once.
+
+        Used by the poll button and the oclean_ble.poll service. Scheduled
+        polls keep honouring the smart-polling gates (_poll_skip_reason).
+        """
+        self._force_poll_once = True
+        try:
+            await self.async_refresh()
+        finally:
+            self._force_poll_once = False
+
     def _resolve_ble_device(self) -> BLEDevice:
         """BLEDevice from HA Bluetooth registry; raises BleakError if not found."""
         service_info = bluetooth.async_last_service_info(self.hass, self._mac, connectable=True)
@@ -855,7 +979,27 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         """Load persisted data from HA storage."""
         stored = await self._store.async_load()
         if stored:
-            self._last_session_ts = stored.get("last_session_ts", 0)
+            # Repair a store poisoned by a corrupt record before anything reads it.
+            # The high-water mark is a one-way ratchet (see session_guard), so a
+            # single future-dated session would otherwise keep blocking imports
+            # across restarts, reinstalls and re-pairings alike.
+            now = int(time.time())
+            raw_history = stored.get("zone_history", [])
+            self._zone_history = filter_plausible_history(raw_history, now)
+            dropped = len(raw_history) - len(self._zone_history)
+            stored_ts = stored.get("last_session_ts", 0)
+            self._last_session_ts = sanitize_last_session_ts(
+                stored_ts, now, [int(e["ts"]) for e in self._zone_history]
+            )
+            if dropped or self._last_session_ts != stored_ts:
+                self._log.warning(
+                    "repaired store: dropped %d implausible history entries, "
+                    "high-water mark %s -> %s; sessions after that point will be "
+                    "re-imported from the device on the next poll",
+                    dropped,
+                    stored_ts,
+                    self._last_session_ts,
+                )
             self._area_remind = stored.get("area_remind")
             self._over_pressure = stored.get("over_pressure")
             self._remind_switch = stored.get("remind_switch")
@@ -863,7 +1007,30 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             self._brush_head_max_days = stored.get("brush_head_max_days")
             self._brush_head_sw_count = stored.get("brush_head_sw_count", 0)
             self._active_scheme_pnum = stored.get("active_scheme_pnum")
+            self._session_group = stored.get("session_group")
+            # One-time migration: slot-scheme devices stored raw slot counts
+            # before 2026-07-05 – normalise them to seconds. Idempotent: after
+            # scaling sum(zones) ≈ duration, so the deviation guard skips them.
+            model = (stored.get("last_session") or {}).get(DATA_MODEL_ID)
+            if model in ZONE_SLOT_MODELS:
+                for entry in self._zone_history:
+                    z = entry.get("zones")
+                    d = int(entry.get("duration") or 0)
+                    total = sum(v for v in z if v > 0) if z else 0
+                    if total > 0 and d > 0 and abs(total - d) / d > 0.25:
+                        entry["zones"] = zones_to_seconds(z, d)
             last_session = stored.get("last_session", {})
+            # The snapshot may describe the very record that poisoned the mark.
+            # Drop its session payload (the device info stays valid) so the
+            # "last session" sensor does not keep reporting a bogus date until
+            # the next successful poll replaces it.
+            snapshot_ts = last_session.get(DATA_LAST_BRUSH_TIME)
+            if snapshot_ts is not None and not is_plausible_session_ts(snapshot_ts, now):
+                self._log.warning(
+                    "discarding persisted session snapshot with implausible timestamp %s",
+                    snapshot_ts,
+                )
+                last_session = {k: v for k, v in last_session.items() if k not in _SESSION_SNAPSHOT_KEYS}
             if last_session:
                 self._last_raw.update(last_session)
             self._log.debug(
@@ -887,6 +1054,8 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                 "brush_head_max_days": self._brush_head_max_days,
                 "brush_head_sw_count": self._brush_head_sw_count,
                 "active_scheme_pnum": self._active_scheme_pnum,
+                "session_group": self._session_group,
+                "zone_history": self._zone_history,
                 "last_session": last_session,
             }
         )
@@ -953,6 +1122,74 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
 
         # Count new sessions before _import_new_sessions updates _last_session_ts
         new_session_count = sum(1 for s in all_sessions if s.get(DATA_LAST_BRUSH_TIME, 0) > self._last_session_ts)
+
+        # Fire one event per NEW session (also for backfilled ones with their
+        # historical timestamp) so automations can log every brushing session —
+        # the letzte_sitzung sensor only jumps to the newest and would miss
+        # sessions delivered in the same poll.
+        if new_session_count:
+            entry = getattr(self, "config_entry", None)
+            for s in sorted(all_sessions, key=lambda x: x.get(DATA_LAST_BRUSH_TIME, 0)):
+                ts = s.get(DATA_LAST_BRUSH_TIME, 0)
+                if ts <= self._last_session_ts:
+                    continue
+                score = s.get(DATA_LAST_BRUSH_SCORE)
+                duration = s.get(DATA_LAST_BRUSH_DURATION)
+
+                areas = s.get(DATA_LAST_BRUSH_AREAS)
+                zones = [int(areas.get(n, 0)) for n in TOOTH_AREA_NAMES] if isinstance(areas, dict) else None
+                # Slot-scheme firmwares (OCLEANY3MD: fixed total of 96 slots)
+                # report unit-less slot counts – convert to real seconds so
+                # events/store/protocol all speak one unit.
+                model = collected.get(DATA_MODEL_ID) or self._last_raw.get(DATA_MODEL_ID)
+                if zones is not None and model in ZONE_SLOT_MODELS:
+                    zones = zones_to_seconds(zones, duration or 0)
+                zones_emoji = zone_emoji_signature(zones)
+
+                # Retention-managed per-session zone history (opt-in via options flow)
+                if zones is not None and self._zone_history_days != 0:
+                    self._zone_history.append(
+                        {
+                            "ts": ts,
+                            "zones": zones,
+                            "duration": duration,
+                            "score": score,
+                            "pnum": s.get(DATA_LAST_BRUSH_PNUM),
+                        }
+                    )
+                    self._zone_history.sort(key=lambda e: e["ts"])
+                    if self._zone_history_days > 0:
+                        cutoff = int(time.time()) - self._zone_history_days * 86400
+                        self._zone_history = [e for e in self._zone_history if e["ts"] >= cutoff]
+
+                # Back-to-back grouping: continue the persisted group when the
+                # gap to its end is within the configured merge window.
+                continuation = self._merge_window_s > 0 and is_group_continuation(
+                    (self._session_group or {}).get("end_ts", 0), ts, self._merge_window_s
+                )
+                if self._merge_window_s > 0:
+                    if continuation and self._session_group is not None:
+                        extend_group(self._session_group, ts, duration or 0, score)
+                    else:
+                        self._session_group = new_group(ts, duration or 0, score)
+
+                self.hass.bus.async_fire(
+                    EVENT_BRUSH_SESSION,
+                    {
+                        "entry_id": entry.entry_id if entry else None,
+                        "mac": self._mac,
+                        "device_name": self._device_name,
+                        "ts": ts,
+                        "score": score,
+                        "duration": duration,
+                        "duration_scheduled": s.get(DATA_LAST_BRUSH_DURATION_SCHEDULED),
+                        "pnum": s.get(DATA_LAST_BRUSH_PNUM),
+                        "group_continuation": continuation,
+                        "group_size": len(self._session_group["scores"]) if self._session_group else 1,
+                        "zones": zones,
+                        "zones_emoji": zones_emoji,
+                    },
+                )
 
         # Import new sessions into HA long-term statistics
         if all_sessions:
@@ -1079,6 +1316,9 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         OCLEANY3P with year_base=0x00 uses ``parse_y3p_stream_record``.
         """
         _log = self._log  # capture for use in the closure
+        # HA-configured timezone, used to resolve offset-less device-local
+        # timestamps to true UTC (review P2.1). Resolved once per poll.
+        _tz = dt_util.get_time_zone(self.hass.config.time_zone) or dt_util.UTC
 
         # Mutable reassembly state – use a dict to avoid 'nonlocal' for primitives.
         _t1: dict[str, Any] = {
@@ -1086,6 +1326,11 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             "buf": bytearray(),
             "expected": 0,
             "parse_fn": parse_t1_c3385w0_record,
+            # Source characteristic (normalised UUID) that delivered the *B#
+            # header. Continuation packets are only accepted from this same
+            # source, so a READ fallback on another characteristic cannot bleed
+            # a standalone frame into the open buffer (review P2.4).
+            "source": None,
         }
 
         # Magic header bytes for the *B# multi-packet format (after 0307 prefix).
@@ -1095,7 +1340,35 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             """Merge one parsed dict into collected/all_sessions (shared logic)."""
             if not parsed:
                 return
+            # Resolve the device-local timestamp to true UTC before it is used
+            # for the "newer wins" comparison or persisted, so every parse path
+            # is on one host-independent convention (review P2.1). The 0308
+            # paths carry a real frame offset; all other binary paths fall back
+            # to the HA timezone. The JSON path opts out (its timestamp is
+            # already epoch-like). The transient marker keys are popped so they
+            # never leak into collected/all_sessions or the stored snapshot.
+            _ts_is_utc = parsed.pop(DATA_LAST_BRUSH_TS_IS_UTC, False)
+            _offset_s = parsed.pop(DATA_LAST_BRUSH_TZ_OFFSET_S, None)
+            if DATA_LAST_BRUSH_TIME in parsed and not _ts_is_utc:
+                parsed[DATA_LAST_BRUSH_TIME] = resolve_session_utc(
+                    parsed[DATA_LAST_BRUSH_TIME], _offset_s, _tz
+                )
             incoming_ts = parsed.get(DATA_LAST_BRUSH_TIME)
+            # Imported sessions are tracked by a single monotonic high-water mark,
+            # which makes it a one-way ratchet: a mis-parsed record stamped in the
+            # future raises the mark beyond every real session and blocks all
+            # further imports permanently and silently (seen in the wild — one
+            # record dated 2240 cost four weeks of data). Drop such a record here,
+            # before it can reach collected, all_sessions or the stored snapshot.
+            # Enrichment notifications carry no timestamp and always pass.
+            if incoming_ts is not None and not is_plausible_session_ts(incoming_ts, int(time.time())):
+                self._log.warning(
+                    "discarding session record with implausible timestamp %s "
+                    "(more than %d s ahead of host time) — record looks corrupt",
+                    incoming_ts,
+                    FUTURE_TOLERANCE_S,
+                )
+                return
             # Only update collected when the incoming data is strictly newer than
             # what we already have.  Older timestamped sessions (e.g. from *B#
             # pagination) are appended to all_sessions for stats import but must
@@ -1119,6 +1392,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             _t1["buf"] = bytearray()
             _t1["expected"] = 0
             _t1["parse_fn"] = parse_t1_c3385w0_record
+            _t1["source"] = None
             num_records = len(buf) // T1_C3352G_RECORD_SIZE
             # OCLEANY3PD uses the APK Y3PD coverage threshold (10) instead of the
             # default (9); all other TYPE1 models use the default.
@@ -1131,14 +1405,19 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
 
         def handler(_sender: Any, raw: bytearray) -> None:
             data = bytes(raw)
+            src = normalize_char_source(_sender)
             _log.debug("notification raw: %s", data.hex())
 
             # --- Continuation packet for active *B# reassembly ---
-            # While reassembly is active, every incoming packet is treated as
-            # continuation data regardless of its first two bytes. Byte count
-            # is the only reliable discriminator: continuation chunks contain
-            # raw record bytes that can coincidentally match any known prefix.
-            if _t1["in_progress"]:
+            # While reassembly is active, further packets from the SAME source
+            # characteristic are treated as continuation data regardless of
+            # their first two bytes (byte count is the only reliable
+            # discriminator: continuation chunks contain raw record bytes that
+            # can coincidentally match any known prefix). A frame from a
+            # *different* characteristic (e.g. a READ fallback on another UUID)
+            # must fall through to normal dispatch, never appended here — see
+            # review P2.4.
+            if is_reassembly_continuation(_t1["in_progress"], _t1["source"], src):
                 _t1["buf"].extend(data)
                 _log.debug(
                     "*B# continuation: +%d bytes (%d/%d)",
@@ -1167,6 +1446,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                     _t1["buf"] = inline
                     _t1["expected"] = total_expected
                     _t1["in_progress"] = True
+                    _t1["source"] = src
                     if payload[5] == 0x00:
                         _t1["parse_fn"] = parse_y3p_stream_record
                         _parser_name = "Y3P-stream"
@@ -1609,7 +1889,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                 current_hex = data.hex()
                 self._log.debug("READ fallback attempt %d: %s", attempt + 1, current_hex)
                 if len(data) > 2 and current_hex != last_hex:
-                    handler(None, bytearray(data))
+                    handler(READ_NOTIFY_CHAR_UUID, bytearray(data))
                     last_hex = current_hex
                 elif current_hex == last_hex:
                     self._log.debug("READ fallback: same data as previous read, stopping")
@@ -1659,7 +1939,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                         BLE_POLL_FALLBACK_ATTEMPTS,
                         hex_str,
                     )
-                    handler(None, bytearray(data))
+                    handler(RECEIVE_BRUSH_UUID, bytearray(data))
                 elif len(data) <= 2:
                     self._log.debug(
                         "poll fallback fbb90 [%d/%d]: too short (%d B)",
@@ -1688,7 +1968,7 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                         BLE_POLL_FALLBACK_ATTEMPTS,
                         hex86,
                     )
-                    handler(None, bytearray(data86))
+                    handler(READ_NOTIFY_CHAR_UUID, bytearray(data86))
             except Exception:  # noqa: BLE001
                 pass  # fbb86 READ failures are expected on some devices
 

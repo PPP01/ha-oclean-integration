@@ -19,13 +19,59 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# Metrics exported to HA long-term statistics
-# (data_key, statistic_name_suffix, unit_of_measurement)
-_STAT_METRICS: tuple[tuple[str, str, str | None], ...] = (
-    (DATA_LAST_BRUSH_SCORE, "brush_score", "%"),
-    (DATA_LAST_BRUSH_DURATION, "brush_duration", "s"),
-    (DATA_LAST_BRUSH_PRESSURE, "brush_pressure", None),
+# Metrics exported to HA long-term statistics: (data_key, statistic_name_suffix).
+_STAT_METRICS: tuple[tuple[str, str], ...] = (
+    (DATA_LAST_BRUSH_SCORE, "brush_score"),
+    (DATA_LAST_BRUSH_DURATION, "brush_duration"),
+    (DATA_LAST_BRUSH_PRESSURE, "brush_pressure"),
 )
+
+# Units and value scaling mirror the corresponding SensorEntityDescription in
+# sensor.py — the single source of truth for what the user sees — so the
+# external-statistics graph matches the live sensor (review P2.2):
+#   * score:    dimensionless (sensor has no native unit) — NOT "%"
+#   * duration: minutes (sensor's suggested display unit); raw seconds / 60
+#   * pressure: dimensionless (sensor has no native unit)
+# These are external statistics with no linked entity, so the declared unit IS
+# the display unit (HA applies no suggested-unit conversion to them). Unit
+# strings are kept as literals (UnitOfTime.MINUTES == "min") so this module
+# stays free of Home Assistant imports and unit-testable with plain pytest.
+_STAT_UNITS: dict[str, str | None] = {
+    DATA_LAST_BRUSH_SCORE: None,
+    DATA_LAST_BRUSH_DURATION: "min",
+    DATA_LAST_BRUSH_PRESSURE: None,
+}
+
+# Seconds in one hour — HA long-term statistics are bucketed hourly.
+_SECONDS_PER_HOUR = 3600
+
+
+def statistic_unit(data_key: str) -> str | None:
+    """Return the statistic unit_of_measurement for a metric (see _STAT_UNITS)."""
+    return _STAT_UNITS.get(data_key)
+
+
+def statistic_value(data_key: str, raw: float) -> float:
+    """Scale a raw metric value into its declared statistic unit (see _STAT_UNITS)."""
+    if data_key == DATA_LAST_BRUSH_DURATION:
+        return round(raw / 60, 4)  # seconds -> minutes
+    return raw
+
+
+def aggregate_hourly(entries: list[tuple[int, float]]) -> list[tuple[int, float]]:
+    """Group (unix_ts, value) pairs into UTC-hour buckets, averaged by mean.
+
+    HA long-term statistics are hourly, so several sessions in the same hour
+    (children, re-brushing) must be merged into one bucket via their mean —
+    emitting duplicate-start rows would let HA collapse them, silently dropping
+    all but one (review P2.3). Returns (hour_start_ts, mean_value) sorted
+    ascending by hour.
+    """
+    buckets: dict[int, list[float]] = {}
+    for ts, value in entries:
+        hour_ts = ts - (ts % _SECONDS_PER_HOUR)
+        buckets.setdefault(hour_ts, []).append(value)
+    return [(hour_ts, sum(vals) / len(vals)) for hour_ts, vals in sorted(buckets.items())]
 
 
 def _load_recorder_api():
@@ -90,18 +136,25 @@ async def import_new_sessions(
 
     from homeassistant.util import dt as dt_util
 
-    for data_key, stat_suffix, unit in _STAT_METRICS:
-        stat_rows: list[Any] = []
+    for data_key, stat_suffix in _STAT_METRICS:
+        pairs: list[tuple[int, float]] = []
         for session in new_sessions:
             value = session.get(data_key)
             if value is None:
                 continue
-            ts = session["last_brush_time"]
-            start_dt = datetime.datetime.fromtimestamp(ts, tz=dt_util.UTC).replace(minute=0, second=0, microsecond=0)
-            stat_rows.append(StatisticData(start=start_dt, mean=float(value), state=float(value)))
+            pairs.append((session["last_brush_time"], statistic_value(data_key, float(value))))
 
-        if not stat_rows:
+        if not pairs:
             continue
+
+        stat_rows: list[Any] = [
+            StatisticData(
+                start=datetime.datetime.fromtimestamp(hour_ts, tz=dt_util.UTC),
+                mean=mean_v,
+                state=mean_v,
+            )
+            for hour_ts, mean_v in aggregate_hourly(pairs)
+        ]
 
         metadata = StatisticMetaData(
             has_mean=True,
@@ -109,7 +162,7 @@ async def import_new_sessions(
             name=f"Oclean {device_name} {stat_suffix.replace('_', ' ').title()}",
             source=DOMAIN,
             statistic_id=f"{DOMAIN}:{mac_slug}_{stat_suffix}",
-            unit_of_measurement=unit,
+            unit_of_measurement=statistic_unit(data_key),
         )
         try:
             async_add_external_statistics(hass, metadata, stat_rows)
@@ -130,19 +183,24 @@ async def import_new_sessions(
         )
 
     # Per-zone area pressures as individual statistics
-    area_stats_by_zone: dict[str, list[Any]] = {}
+    area_pairs_by_zone: dict[str, list[tuple[int, float]]] = {}
     for session in new_sessions:
         areas = session.get(DATA_LAST_BRUSH_AREAS)
         if not isinstance(areas, dict):
             continue
         ts = session["last_brush_time"]
-        start_dt = datetime.datetime.fromtimestamp(ts, tz=dt_util.UTC).replace(minute=0, second=0, microsecond=0)
         for zone_name, pressure in areas.items():
-            area_stats_by_zone.setdefault(zone_name, []).append(
-                StatisticData(start=start_dt, mean=float(pressure), state=float(pressure))
-            )
+            area_pairs_by_zone.setdefault(zone_name, []).append((ts, float(pressure)))
 
-    for zone_name, stat_rows in area_stats_by_zone.items():
+    for zone_name, area_pairs in area_pairs_by_zone.items():
+        stat_rows = [
+            StatisticData(
+                start=datetime.datetime.fromtimestamp(hour_ts, tz=dt_util.UTC),
+                mean=mean_v,
+                state=mean_v,
+            )
+            for hour_ts, mean_v in aggregate_hourly(area_pairs)
+        ]
         metadata = StatisticMetaData(
             has_mean=True,
             has_sum=False,
