@@ -1,5 +1,15 @@
 # Oclean Toothbrush (unofficial) – Home Assistant Integration
 
+> ### ⚠️ This is a self-maintained fork
+>
+> Upstream [`deniskie/ha-oclean-integration`](https://github.com/deniskie/ha-oclean-integration)
+> has seen no merged pull request since 2026-06-17. This fork is the HACS source for a
+> production Home Assistant instance and carries fixes that were submitted upstream but
+> never reviewed (PRs #116, #117, #118, #120, #121, #122, #123, #125 — all conflict-free),
+> plus further local work. Releases here are cut on demand, not on a schedule.
+>
+> The sections below are upstream's documentation and describe upstream's repository.
+
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![GitHub Release](https://img.shields.io/github/v/release/deniskie/ha-oclean-integration)](https://github.com/deniskie/ha-oclean-integration/releases)
 [![License](https://img.shields.io/github/license/deniskie/ha-oclean-integration)](LICENSE)
