@@ -22,6 +22,7 @@ def _make_coordinator():
     coord.async_reset_brush_head = AsyncMock()
     coord.async_sync_time = AsyncMock()
     coord.async_request_refresh = AsyncMock()
+    coord.async_poll_now = AsyncMock()
     return coord
 
 
@@ -79,7 +80,7 @@ class TestOcleanButtonAsyncPress:
     async def test_poll_now(self):
         button, coord = _make_button("poll_now")
         await button.async_press()
-        coord.async_request_refresh.assert_awaited_once()
+        coord.async_poll_now.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -97,3 +98,10 @@ class TestOcleanButtonUnknownKey:
         coord.async_reset_brush_head.assert_not_awaited()
         coord.async_sync_time.assert_not_awaited()
         coord.async_request_refresh.assert_not_awaited()
+
+
+def test_parallel_updates_serialises_ble_actions():
+    """The brush accepts one GATT connection; entity actions must be serialised."""
+    from custom_components.oclean_ble import button as platform_module
+
+    assert platform_module.PARALLEL_UPDATES == 1
