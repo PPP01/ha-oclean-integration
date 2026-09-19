@@ -5,13 +5,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from homeassistant.components import bluetooth
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     PERCENTAGE,
@@ -604,8 +604,10 @@ class OcleanRssiSensor(OcleanEntity, SensorEntity):
             adv = device.advertisement
             if adv is None or adv.rssi is None:
                 continue
-            name = getattr(device.scanner, "name", None) or getattr(device.scanner, "source", "?")
-            by_scanner[name] = adv.rssi
+            # Scanner objects expose either a friendly name or a source id;
+            # fall back to "?" so the attribute key is always a string.
+            name = getattr(device.scanner, "name", None) or getattr(device.scanner, "source", None)
+            by_scanner[str(name) if name else "?"] = adv.rssi
         if by_scanner:
             attrs["by_scanner"] = by_scanner
         return attrs or None

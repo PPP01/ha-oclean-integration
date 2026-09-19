@@ -664,3 +664,30 @@ class TestOcleanRssiSensor:
         sensor.async_write_ha_state = MagicMock()
         sensor._advertisement_callback(MagicMock(), MagicMock())
         sensor.async_write_ha_state.assert_called_once()
+
+
+class TestOcleanRssiSensorScannerNames:
+    def test_scanner_without_name_falls_back_to_source(self, monkeypatch):
+        from homeassistant.components import bluetooth
+
+        sensor = _make_rssi_sensor()
+        device = MagicMock()
+        device.advertisement.rssi = -66
+        device.scanner = MagicMock(spec=["source"])
+        device.scanner.source = "AA:BB:CC:00:11:22"
+        monkeypatch.setattr(bluetooth, "async_last_service_info", MagicMock(return_value=_service_info()))
+        monkeypatch.setattr(bluetooth, "async_scanner_devices_by_address", MagicMock(return_value=[device]))
+
+        assert sensor.extra_state_attributes["by_scanner"] == {"AA:BB:CC:00:11:22": -66}
+
+    def test_scanner_without_name_or_source_uses_placeholder(self, monkeypatch):
+        from homeassistant.components import bluetooth
+
+        sensor = _make_rssi_sensor()
+        device = MagicMock()
+        device.advertisement.rssi = -66
+        device.scanner = MagicMock(spec=[])
+        monkeypatch.setattr(bluetooth, "async_last_service_info", MagicMock(return_value=_service_info()))
+        monkeypatch.setattr(bluetooth, "async_scanner_devices_by_address", MagicMock(return_value=[device]))
+
+        assert sensor.extra_state_attributes["by_scanner"] == {"?": -66}
