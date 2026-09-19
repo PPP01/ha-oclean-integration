@@ -159,11 +159,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if entry_id:
                 coordinator = domain_data.get(entry_id)
                 if coordinator and isinstance(coordinator, OcleanCoordinator):
-                    await coordinator.async_request_refresh()
+                    await coordinator.async_poll_now()
             else:
                 for key, value in domain_data.items():
                     if not key.startswith("_") and isinstance(value, OcleanCoordinator):
-                        await value.async_request_refresh()
+                        await value.async_poll_now()
 
         hass.services.async_register(
             DOMAIN,

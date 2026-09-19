@@ -1529,9 +1529,24 @@ def _map_json_brush_data(data: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for result_key, candidates, cast_int in _JSON_KEY_MAP:
         for key in candidates:
-            if key in data:
-                result[result_key] = int(data[key]) if cast_int else data[key]
-                break
+            if key not in data:
+                continue
+            value = data[key]
+            if cast_int:
+                # The device (or BLE proxy) may send a non-numeric value
+                # (e.g. "n/a", null, or a nested object). Skip the field
+                # instead of letting int() raise out of parse_notification().
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    _LOGGER.debug(
+                        "Oclean JSON field %r has non-integer value %r – skipped",
+                        key,
+                        value,
+                    )
+                    break
+            result[result_key] = value
+            break
     if result:
         _LOGGER.debug("Oclean brush session data mapped: %s", result)
     else:
