@@ -517,3 +517,150 @@ class TestOcleanPowerDistributionSensor:
             data={DATA_LAST_BRUSH_TIME: 1_700_000_000, DATA_LAST_BRUSH_GESTURE_CODE: None},
         )
         assert sensor.available is False
+
+
+# ---------------------------------------------------------------------------
+# OcleanRssiSensor – advertisement RSSI, read from HA's Bluetooth registry
+# ---------------------------------------------------------------------------
+
+
+def _make_rssi_sensor():
+    from custom_components.oclean_ble.sensor import OcleanRssiSensor
+
+    coord = _make_coordinator(data={})
+    sensor = OcleanRssiSensor(coord, "AA:BB:CC:DD:EE:FF", "Oclean")
+    sensor.hass = MagicMock()
+    return sensor
+
+
+def _service_info(rssi=-70, source="proxy-kitchen"):
+    info = MagicMock()
+    info.rssi = rssi
+    info.source = source
+    return info
+
+
+def _scanner_device(rssi, name):
+    device = MagicMock()
+    device.advertisement.rssi = rssi
+    device.scanner.name = name
+    return device
+
+
+class TestOcleanRssiSensor:
+    """The value comes from the Bluetooth registry, not from a BLE poll, so it
+    stays meaningful while the brush is asleep and between polls."""
+
+    def test_native_value_is_last_advertisement_rssi(self, monkeypatch):
+        from homeassistant.components import bluetooth
+
+        sensor = _make_rssi_sensor()
+        monkeypatch.setattr(bluetooth, "async_last_service_info", MagicMock(return_value=_service_info(rssi=-83)))
+        assert sensor.native_value == -83
+
+    def test_native_value_none_when_never_seen(self, monkeypatch):
+        from homeassistant.components import bluetooth
+
+        sensor = _make_rssi_sensor()
+        monkeypatch.setattr(bluetooth, "async_last_service_info", MagicMock(return_value=None))
+        assert sensor.native_value is None
+
+    def test_unavailable_when_never_seen(self, monkeypatch):
+        from homeassistant.components import bluetooth
+
+        sensor = _make_rssi_sensor()
+        monkeypatch.setattr(bluetooth, "async_last_service_info", MagicMock(return_value=None))
+        assert sensor.available is False
+
+    def test_available_even_when_poll_failed(self, monkeypatch):
+        # The advertisement is passive: a failed GATT poll must not make the
+        # signal-strength sensor unavailable.
+        from homeassistant.components import bluetooth
+
+        from custom_components.oclean_ble.sensor import OcleanRssiSensor
+
+        coord = _make_coordinator(data=None, last_update_success=False)
+        sensor = OcleanRssiSensor(coord, "AA:BB:CC:DD:EE:FF", "Oclean")
+        sensor.hass = MagicMock()
+        monkeypatch.setattr(bluetooth, "async_last_service_info", MagicMock(return_value=_service_info()))
+        assert sensor.available is True
+
+    def test_attributes_expose_source_and_per_scanner_rssi(self, monkeypatch):
+        from homeassistant.components import bluetooth
+
+        sensor = _make_rssi_sensor()
+        monkeypatch.setattr(
+            bluetooth,
+            "async_last_service_info",
+            MagicMock(return_value=_service_info(rssi=-70, source="proxy-kitchen")),
+        )
+        monkeypatch.setattr(
+            bluetooth,
+            "async_scanner_devices_by_address",
+            MagicMock(
+                return_value=[
+                    _scanner_device(-70, "proxy-kitchen"),
+                    _scanner_device(-91, "proxy-bath"),
+                ]
+            ),
+        )
+        attrs = sensor.extra_state_attributes
+        assert attrs["source"] == "proxy-kitchen"
+        assert attrs["by_scanner"] == {"proxy-kitchen": -70, "proxy-bath": -91}
+
+    def test_attributes_none_when_nothing_known(self, monkeypatch):
+        from homeassistant.components import bluetooth
+
+        sensor = _make_rssi_sensor()
+        monkeypatch.setattr(bluetooth, "async_last_service_info", MagicMock(return_value=None))
+        monkeypatch.setattr(bluetooth, "async_scanner_devices_by_address", MagicMock(return_value=[]))
+        assert sensor.extra_state_attributes is None
+
+    def test_scanner_without_advertisement_is_skipped(self, monkeypatch):
+        from homeassistant.components import bluetooth
+
+        sensor = _make_rssi_sensor()
+        stale = MagicMock()
+        stale.advertisement = None
+        monkeypatch.setattr(bluetooth, "async_last_service_info", MagicMock(return_value=_service_info()))
+        monkeypatch.setattr(
+            bluetooth,
+            "async_scanner_devices_by_address",
+            MagicMock(return_value=[stale, _scanner_device(-77, "proxy-hall")]),
+        )
+        assert sensor.extra_state_attributes["by_scanner"] == {"proxy-hall": -77}
+
+    def test_entity_metadata(self):
+        from homeassistant.components.sensor import SensorStateClass
+        from homeassistant.const import SIGNAL_STRENGTH_DECIBELS_MILLIWATT, EntityCategory
+
+        sensor = _make_rssi_sensor()
+        assert sensor._attr_device_class == SensorDeviceClass.SIGNAL_STRENGTH
+        assert sensor._attr_state_class == SensorStateClass.MEASUREMENT
+        assert sensor._attr_native_unit_of_measurement == SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+        assert sensor._attr_entity_category == EntityCategory.DIAGNOSTIC
+        assert sensor._attr_translation_key == "rssi"
+
+    @pytest.mark.asyncio
+    async def test_registers_passive_advertisement_callback(self, monkeypatch):
+        from homeassistant.components import bluetooth
+
+        sensor = _make_rssi_sensor()
+        register = MagicMock(return_value=lambda: None)
+        monkeypatch.setattr(bluetooth, "async_register_callback", register)
+
+        await sensor.async_added_to_hass()
+
+        register.assert_called_once()
+        matcher = register.call_args[0][2]
+        assert matcher.address == "AA:BB:CC:DD:EE:FF"
+        assert matcher.connectable is False
+        assert register.call_args[0][3] == bluetooth.BluetoothScanningMode.PASSIVE
+        # The unsubscribe callable is registered for teardown.
+        assert len(sensor._on_remove_callbacks) == 1
+
+    def test_advertisement_callback_pushes_state(self):
+        sensor = _make_rssi_sensor()
+        sensor.async_write_ha_state = MagicMock()
+        sensor._advertisement_callback(MagicMock(), MagicMock())
+        sensor.async_write_ha_state.assert_called_once()

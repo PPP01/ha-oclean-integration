@@ -51,6 +51,7 @@ def _install_ha_stubs() -> None:
     const.__version__ = "2025.1.0"
     const.Platform = Enum("Platform", ["SENSOR", "BINARY_SENSOR", "BUTTON", "NUMBER", "SELECT", "SWITCH"])
     const.PERCENTAGE = "%"
+    const.SIGNAL_STRENGTH_DECIBELS_MILLIWATT = "dBm"
 
     class UnitOfTime:
         SECONDS = "s"
@@ -178,6 +179,14 @@ def _install_ha_stubs() -> None:
         def __class_getitem__(cls, item):
             return cls
 
+        async def async_added_to_hass(self):
+            """No-op stand-in for HA's coordinator subscription hook."""
+
+        def async_on_remove(self, func):
+            """Record the unsubscribe callable the way HA does."""
+            self._on_remove_callbacks = getattr(self, "_on_remove_callbacks", [])
+            self._on_remove_callbacks.append(func)
+
     uc.UpdateFailed = UpdateFailed
     uc.DataUpdateCoordinator = DataUpdateCoordinator
     uc.CoordinatorEntity = CoordinatorEntity
@@ -230,6 +239,22 @@ def _install_ha_stubs() -> None:
     bt = _stub("homeassistant.components.bluetooth")
     bt.async_last_service_info = MagicMock(return_value=None)
     bt.async_discovered_service_info = MagicMock(return_value=[])
+    # Passive advertisement listening (RSSI sensor). Default: registering is a
+    # no-op returning an unsubscribe callable, and no scanner has seen the MAC.
+    bt.async_register_callback = MagicMock(return_value=lambda: None)
+    bt.async_scanner_devices_by_address = MagicMock(return_value=[])
+
+    class BluetoothCallbackMatcher:
+        def __init__(self, address=None, connectable=None):
+            self.address = address
+            self.connectable = connectable
+
+    class BluetoothScanningMode(Enum):
+        PASSIVE = "passive"
+        ACTIVE = "active"
+
+    bt.BluetoothCallbackMatcher = BluetoothCallbackMatcher
+    bt.BluetoothScanningMode = BluetoothScanningMode
 
     class BluetoothServiceInfoBleak:
         pass
@@ -244,6 +269,7 @@ def _install_ha_stubs() -> None:
         BATTERY = "battery"
         DURATION = "duration"
         TIMESTAMP = "timestamp"
+        SIGNAL_STRENGTH = "signal_strength"
 
     class SensorStateClass(Enum):
         MEASUREMENT = "measurement"
