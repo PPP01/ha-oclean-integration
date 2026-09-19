@@ -218,11 +218,13 @@ When no windows are configured, the device is polled at every interval.
 
 ### Debug Logging
 
-The integration writes a dedicated log file `oclean_ble.log` to the same directory as your `configuration.yaml` (e.g. `/config/oclean_ble.log`). The file rotates at 1 MB and keeps up to 3 files.
+Debug logging is **opt-in**. While it is disabled, the integration writes nothing to disk — warnings and errors still go to the main HA log (Settings → Logs) as usual. This keeps raw BLE payloads, session scores and your device MAC out of the config directory (and therefore out of your backups) unless you ask for them.
 
-**Debug entries (raw BLE payloads, parse results, etc.) are only written when the log level is set to `debug`.** Without this, only warnings and errors appear in both `oclean_ble.log` and the main HA log.
+**Enable it one of two ways:**
 
-Add the following to `configuration.yaml`:
+*Option A – UI (no restart):* Settings → Devices & Services → Oclean → ⋮ → **Enable debug logging**. Home Assistant reloads the integration automatically.
+
+*Option B – `configuration.yaml`:*
 
 ```yaml
 logger:
@@ -231,7 +233,11 @@ logger:
     custom_components.oclean_ble: debug
 ```
 
-This enables debug output in both `oclean_ble.log` and the **main HA log** (Settings → Logs).
+Then restart Home Assistant, or reload the Oclean integration.
+
+Once enabled, the integration writes a dedicated log file `oclean_ble.log` next to your `configuration.yaml` (e.g. `/config/oclean_ble.log`), in addition to the main HA log. The file rotates at 1 MB and keeps up to 3 files.
+
+To stop writing the file again, turn debug logging back off and reload the integration (or restart HA). The existing `oclean_ble.log` is not deleted — remove it manually if you no longer want it.
 
 After brushing, filter the log for `Oclean` to see raw Bluetooth payloads.
 Unknown notification types are logged as hex – this helps extend the parser.

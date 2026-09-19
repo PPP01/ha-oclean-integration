@@ -73,7 +73,7 @@ BLE Device
 | `entity.py` | `OcleanEntity` base class – shared `unique_id`, `device_info`, and `available` logic |
 | `sensor.py` | All sensor entities; `OcleanSensor` (generic), `OcleanBrushAreasSensor` (zone dict as attributes), `OcleanSchemeSensor` (pNum + name attribute) |
 | `config_flow.py` | Config + options flow; auto-discovery via Bluetooth, manual MAC entry fallback |
-| `__init__.py` | `async_setup_entry` / `async_unload_entry`; attaches/detaches a rotating file log handler (`oclean_ble.log`, 1 MB × 3) shared across all config entries |
+| `__init__.py` | `async_setup_entry` / `async_unload_entry`; attaches/detaches a rotating file log handler (`oclean_ble.log`, 1 MB × 3) shared across all config entries. **Opt-in:** the handler is only attached when debug logging is enabled for `custom_components.oclean_ble` at setup time |
 
 ### Parser format detection (0308 path)
 
@@ -103,7 +103,7 @@ Tests run **without a full Home Assistant instance**. `tests/conftest.py` inject
 
 ## Log analysis (`oclean_ble.log`)
 
-The integration writes `oclean_ble.log` to the HA config directory automatically (no `configuration.yaml` change needed). Use a Task/Bash agent to analyze it – the file can exceed 256 KB.
+The integration writes `oclean_ble.log` to the HA config directory **only while debug logging is enabled** for `custom_components.oclean_ble` (UI toggle under the integration's ⋮ menu, or a `logger:` entry in `configuration.yaml` + reload). Without debug enabled no file is created at all. When asking a user for a log, tell them to enable debug logging first, reload the integration, then brush. Use a Task/Bash agent to analyze it – the file can exceed 256 KB.
 
 ### Key grep patterns
 
