@@ -106,3 +106,10 @@ class TestOcleanNumberUnknownKey:
         desc = NumberEntityDescription(key="nonexistent")
         number = OcleanNumber(coord, desc, "AA:BB:CC:DD:EE:FF", "Oclean")
         assert number.native_value is None
+
+
+def test_parallel_updates_serialises_ble_actions():
+    """The brush accepts one GATT connection; entity actions must be serialised."""
+    from custom_components.oclean_ble import number as platform_module
+
+    assert platform_module.PARALLEL_UPDATES == 1

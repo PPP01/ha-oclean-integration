@@ -253,3 +253,10 @@ class TestAsyncSelectOption:
         entity.coordinator.async_set_brush_scheme = AsyncMock()
         await entity.async_select_option("Gestation Care")
         entity.coordinator.async_set_brush_scheme.assert_awaited_once_with(90)
+
+
+def test_parallel_updates_serialises_ble_actions():
+    """The brush accepts one GATT connection; entity actions must be serialised."""
+    from custom_components.oclean_ble import select as platform_module
+
+    assert platform_module.PARALLEL_UPDATES == 1

@@ -19,6 +19,10 @@ from .coordinator import OcleanCoordinator
 from .entity import OcleanEntity
 from .protocol import TYPE1, TYPE_Z1, is_known_model, protocol_for_model
 
+# The toothbrush accepts only ONE GATT connection at a time; serialise entity
+# actions so two concurrent writes cannot race for the single BLE slot.
+PARALLEL_UPDATES = 1
+
 
 def _schemes_for_model(
     model_id: str | None,
