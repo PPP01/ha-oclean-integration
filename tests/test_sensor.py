@@ -517,3 +517,52 @@ class TestOcleanPowerDistributionSensor:
             data={DATA_LAST_BRUSH_TIME: 1_700_000_000, DATA_LAST_BRUSH_GESTURE_CODE: None},
         )
         assert sensor.available is False
+
+
+# ---------------------------------------------------------------------------
+# OcleanDurationSensor – real brushed time + scheduled length as attribute
+# ---------------------------------------------------------------------------
+
+
+def _make_duration_sensor(data=None):
+    from custom_components.oclean_ble.sensor import OcleanDurationSensor
+
+    return OcleanDurationSensor(_make_coordinator(data=data), "AA:BB:CC:DD:EE:FF", "Oclean")
+
+
+class TestOcleanDurationSensor:
+    def test_state_is_the_real_brushed_time(self):
+        from custom_components.oclean_ble.const import (
+            DATA_LAST_BRUSH_DURATION_SCHEDULED,
+        )
+
+        sensor = _make_duration_sensor({DATA_LAST_BRUSH_DURATION: 31, DATA_LAST_BRUSH_DURATION_SCHEDULED: 180})
+        assert sensor.native_value == 31
+
+    def test_scheduled_length_exposed_as_attribute(self):
+        from custom_components.oclean_ble.const import (
+            DATA_LAST_BRUSH_DURATION_SCHEDULED,
+        )
+
+        sensor = _make_duration_sensor({DATA_LAST_BRUSH_DURATION: 31, DATA_LAST_BRUSH_DURATION_SCHEDULED: 180})
+        assert sensor.extra_state_attributes == {"scheduled_duration_s": 180}
+
+    def test_no_attribute_when_scheduled_unknown(self):
+        # Layouts that do not expose validDuration report no scheduled length.
+        sensor = _make_duration_sensor({DATA_LAST_BRUSH_DURATION: 120})
+        assert sensor.extra_state_attributes is None
+
+    def test_no_attribute_without_coordinator_data(self):
+        sensor = _make_duration_sensor(None)
+        assert sensor.extra_state_attributes is None
+
+    def test_keeps_the_duration_entity_key(self):
+        # Same key/unique_id as the previous description-driven sensor, so
+        # existing entity history is preserved.
+        sensor = _make_duration_sensor({})
+        assert sensor.entity_description.key == DATA_LAST_BRUSH_DURATION
+        assert sensor.entity_description.device_class == SensorDeviceClass.DURATION
+
+    def test_duration_not_also_in_description_tuple(self):
+        # Guard against the sensor being created twice (duplicate unique_id).
+        assert all(d.key != DATA_LAST_BRUSH_DURATION for d in SENSOR_DESCRIPTIONS)

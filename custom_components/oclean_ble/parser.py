@@ -307,13 +307,12 @@ def _parse_xx03_session_record(data: bytes) -> dict[str, Any]:
         if 0 < score <= 100:
             result[DATA_LAST_BRUSH_SCORE] = score
 
-        # bytes 16-17 = scheduled programme length, bytes 18-19 = real brushed time
-        scheduled = (data[16] << 8) | data[17]
-        real = _real_duration_s(scheduled, (data[18] << 8) | data[19])
-        if real is not None:
-            result[DATA_LAST_BRUSH_DURATION] = real
-        if scheduled > 0:
-            result[DATA_LAST_BRUSH_DURATION_SCHEDULED] = scheduled
+        # NOTE: validDuration (the real brushed time) is only applied on the
+        # verified m18f/C3385w0 layout – see _real_duration_s. This record's
+        # field order is not confirmed, so bytes 16-17 stay the duration.
+        duration = (data[16] << 8) | data[17]
+        if duration > 0:
+            result[DATA_LAST_BRUSH_DURATION] = duration
 
         _LOGGER.debug(
             "Oclean XX03 session record parsed: ts=%d score=%s pNum=%d duration=%s (raw: %s)",
@@ -431,10 +430,20 @@ def _real_duration_s(scheduled_s: int, valid_s: int) -> int | None:
     ~31 s stores scheduled=180, valid=31 — the sensor must report 31.
 
     Prefers valid when plausible (0 < valid <= scheduled); falls back to the
-    scheduled value when the device leaves validDuration empty. Because the
-    real time can never exceed the scheduled time, this also self-corrects on
-    models that carry the two fields in swapped order: whichever field holds
-    the smaller non-zero value is the real one. Returns None when both are 0.
+    scheduled value when the device leaves validDuration empty. Returns None
+    when both are 0.
+
+    SCOPE: only applied on the m18f / C3385w0 42-byte layout, where the field
+    order is confirmed. Corroboration on the OCLEANY3MH record above: the
+    gestureArray (per-zone seconds, bytes 23-30) sums to 30, matching
+    valid=31 rather than scheduled=180.
+
+    Deliberately NOT applied to parse_t1_c3352g_record, parse_y3p_stream_record,
+    _parse_xx03_session_record or _parse_extended_running_data_record: on the
+    real OCLEANY3P record from issue #49 the gestureArray sums to 97 against
+    bytes 7-8 = 120, while bytes 9-10 hold 11 — so 9-10 is not the brushed
+    time there. Those paths need a captured record of a deliberately aborted
+    session before they can be switched over.
     """
     if valid_s > 0 and (scheduled_s == 0 or valid_s <= scheduled_s):
         return valid_s
@@ -713,21 +722,20 @@ def parse_t1_c3352g_record(
         # pNum at byte 6 (uncertain offset – positional from C3385w0)
         result[DATA_LAST_BRUSH_PNUM] = int(record[6])
 
-        # bytes 7-8 = scheduled programme length, bytes 9-10 = real brushed time
-        scheduled_s = (record[7] << 8) | record[8]
-        real_s = _real_duration_s(scheduled_s, (record[9] << 8) | record[10])
-        if real_s is not None:
-            result[DATA_LAST_BRUSH_DURATION] = real_s
-        if scheduled_s > 0:
-            result[DATA_LAST_BRUSH_DURATION_SCHEDULED] = scheduled_s
+        # Duration at bytes 7-8 BE (uncertain offset). NOT switched to
+        # validDuration: on the real OCLEANY3P record from issue #49 the
+        # gestureArray sums to 97 against bytes 7-8 = 120, while bytes 9-10
+        # hold 11 – so 9-10 is not the brushed time on this layout.
+        duration_s = (record[7] << 8) | record[8]
+        if duration_s > 0:
+            result[DATA_LAST_BRUSH_DURATION] = duration_s
 
         # Score at byte 33 (confirmed APK: C3352g_fallback.java r57=byte[33])
         score = record[33]
         if 0 < score <= 100:
             result[DATA_LAST_BRUSH_SCORE] = score
 
-        # Coverage norm intentionally keeps the scheduled length (APK formula).
-        _apply_m18f_metrics(result, record, scheduled_s, coverage_norm_threshold)
+        _apply_m18f_metrics(result, record, duration_s, coverage_norm_threshold)
 
         _LOGGER.debug("Oclean C3352g record point=%d (raw byte 34, APK: not used)", record[34])
         _LOGGER.debug(
@@ -807,22 +815,17 @@ def parse_y3p_stream_record(
         timestamp_s = int(time.mktime(device_dt.timetuple()))
         result: dict[str, Any] = {DATA_LAST_BRUSH_TIME: timestamp_s}
 
-        # bytes 7-8 = scheduled programme length; bytes 9-10 = real brushed time
-        # (validDuration position unverified on Y3P — the plausibility guard in
-        # _real_duration_s falls back to bytes 7-8 when 9-10 is empty/implausible)
-        scheduled_s = (record[7] << 8) | record[8]
-        real_s = _real_duration_s(scheduled_s, (record[9] << 8) | record[10])
-        if real_s is not None:
-            result[DATA_LAST_BRUSH_DURATION] = real_s
-        if scheduled_s > 0:
-            result[DATA_LAST_BRUSH_DURATION_SCHEDULED] = scheduled_s
+        # Duration at bytes 7-8 BE. Same reasoning as parse_t1_c3352g_record:
+        # validDuration is not confirmed at bytes 9-10 on this layout.
+        duration_s = (record[7] << 8) | record[8]
+        if duration_s > 0:
+            result[DATA_LAST_BRUSH_DURATION] = duration_s
 
         score = record[33]
         if 0 < score <= 100:
             result[DATA_LAST_BRUSH_SCORE] = score
 
-        # Coverage norm intentionally keeps the scheduled length (APK formula).
-        _apply_m18f_metrics(result, record, scheduled_s, coverage_norm_threshold)
+        _apply_m18f_metrics(result, record, duration_s, coverage_norm_threshold)
 
         _LOGGER.debug("Oclean Y3P stream record point=%d (raw byte 34, APK: not used)", record[34])
         _LOGGER.debug(
@@ -1069,9 +1072,7 @@ def _parse_extended_running_data_record(data: bytes) -> dict[str, Any]:
     try:
         device_dt = _device_datetime(data[2], data[3], data[4], data[5], data[6], data[7])
         p_num = int(data[8])
-        # bytes 9-10 = scheduled programme length, bytes 11-12 = real brushed time
-        scheduled = int.from_bytes(data[9:11], byteorder="big")
-        duration = _real_duration_s(scheduled, int.from_bytes(data[11:13], byteorder="big")) or 0
+        duration = int.from_bytes(data[9:11], byteorder="big")
         # data[13:18]: 5 intermediate pressure zone values (not mapped to sensors)
         tz_offset_quarters = _parse_signed_byte(data[19])
         area_pressures = data[20:28]  # 8 tooth area pressure bytes
@@ -1088,8 +1089,6 @@ def _parse_extended_running_data_record(data: bytes) -> dict[str, Any]:
             DATA_LAST_BRUSH_COVERAGE: coverage_pct,
             DATA_LAST_BRUSH_PNUM: p_num,
         }
-        if scheduled > 0:
-            result[DATA_LAST_BRUSH_DURATION_SCHEDULED] = scheduled
 
         _LOGGER.debug(
             "Oclean extended running-data: ts=%d score=%d duration=%ds pNum=%d zones_cleaned=%d/8 coverage=%d%% avg_pressure=%d",
