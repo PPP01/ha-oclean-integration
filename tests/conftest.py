@@ -85,12 +85,27 @@ def _install_ha_stubs() -> None:
             self.data = data or {}
             self.options = options or {}
             self.entry_id = entry_id
+            # Tasks created via async_create_background_task, so tests can await
+            # them deterministically instead of racing the event loop.
+            self.background_tasks = []
 
         def add_update_listener(self, cb):
             return lambda: None
 
         def async_on_unload(self, cb):
             pass
+
+        def async_create_background_task(self, hass, target, name=None, eager_start=True):
+            """Stub of HA's entry-scoped background task helper.
+
+            Schedules *target* on the running loop and keeps a reference in
+            ``background_tasks``; tests await those to observe the result.
+            """
+            import asyncio
+
+            task = asyncio.ensure_future(target)
+            self.background_tasks.append(task)
+            return task
 
     class _ConfigFlow:
         """Base stub – real flow subclasses this."""

@@ -42,6 +42,23 @@ def _make_hass(config_dir: str | None = None) -> MagicMock:
     return hass
 
 
+def _run_setup(hass, entry):
+    """Run async_setup_entry and drain the entry's background tasks.
+
+    The initial poll is scheduled via entry.async_create_background_task (it
+    must not block HA startup), so tests have to await it explicitly before
+    asserting on the coordinator.
+    """
+
+    async def _inner():
+        result = await async_setup_entry(hass, entry)
+        if getattr(entry, "background_tasks", None):
+            await asyncio.gather(*entry.background_tasks)
+        return result
+
+    return asyncio.run(_inner())
+
+
 def _make_entry(entry_id: str = "test_entry") -> MagicMock:
     from homeassistant.config_entries import ConfigEntry
 
@@ -177,7 +194,7 @@ class TestAsyncSetupEntry:
         mock_coord.async_refresh = AsyncMock()
         mock_coord_cls.return_value = mock_coord
 
-        result = asyncio.run(async_setup_entry(hass, entry))
+        result = _run_setup(hass, entry)
 
         assert result is True
         assert hass.data[DOMAIN][entry.entry_id] is mock_coord
@@ -189,7 +206,7 @@ class TestAsyncSetupEntry:
         entry = _make_entry()
         mock_coord_cls.return_value = MagicMock(async_refresh=AsyncMock())
 
-        asyncio.run(async_setup_entry(hass, entry))
+        _run_setup(hass, entry)
 
         hass.config_entries.async_forward_entry_setups.assert_awaited_once_with(entry, PLATFORMS)
 
@@ -202,9 +219,53 @@ class TestAsyncSetupEntry:
         mock_coord.async_refresh = AsyncMock()
         mock_coord_cls.return_value = mock_coord
 
-        asyncio.run(async_setup_entry(hass, entry))
+        _run_setup(hass, entry)
 
         mock_coord.async_refresh.assert_awaited_once()
+
+    @patch("custom_components.oclean_ble._attach_file_handler", new_callable=AsyncMock)
+    @patch("custom_components.oclean_ble.OcleanCoordinator")
+    def test_initial_refresh_does_not_block_setup(self, mock_coord_cls, mock_attach):
+        # Regression: awaiting the initial poll stalled HA startup for up to
+        # BLE_POLL_TOTAL_TIMEOUT per sleeping brush ("still starting" warning).
+        # Setup must return while the poll is still in flight.
+        hass = _make_hass()
+        entry = _make_entry()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_refresh():
+            started.set()
+            await release.wait()
+
+        mock_coord = MagicMock()
+        mock_coord.async_refresh = AsyncMock(side_effect=_slow_refresh)
+        mock_coord_cls.return_value = mock_coord
+
+        async def _inner():
+            result = await async_setup_entry(hass, entry)
+            # Setup returned even though the poll has not finished.
+            await asyncio.wait_for(started.wait(), timeout=1)
+            assert not entry.background_tasks[0].done()
+            release.set()
+            await asyncio.gather(*entry.background_tasks)
+            return result
+
+        assert asyncio.run(_inner()) is True
+        mock_coord.async_refresh.assert_awaited_once()
+
+    @patch("custom_components.oclean_ble._attach_file_handler", new_callable=AsyncMock)
+    @patch("custom_components.oclean_ble.OcleanCoordinator")
+    def test_initial_refresh_task_is_entry_scoped(self, mock_coord_cls, mock_attach):
+        # The task must be created on the config entry (not a bare
+        # asyncio.create_task) so HA cancels it automatically on unload.
+        hass = _make_hass()
+        entry = _make_entry()
+        mock_coord_cls.return_value = MagicMock(async_refresh=AsyncMock())
+
+        _run_setup(hass, entry)
+
+        assert len(entry.background_tasks) == 1
 
     @patch("custom_components.oclean_ble._attach_file_handler", new_callable=AsyncMock)
     @patch("custom_components.oclean_ble.OcleanCoordinator")
@@ -213,7 +274,7 @@ class TestAsyncSetupEntry:
         entry = _make_entry()
         mock_coord_cls.return_value = MagicMock(async_refresh=AsyncMock())
 
-        asyncio.run(async_setup_entry(hass, entry))
+        _run_setup(hass, entry)
 
         hass.services.async_register.assert_called_once()
         call_args = hass.services.async_register.call_args
@@ -228,7 +289,7 @@ class TestAsyncSetupEntry:
         entry = _make_entry()
         mock_coord_cls.return_value = MagicMock(async_refresh=AsyncMock())
 
-        asyncio.run(async_setup_entry(hass, entry))
+        _run_setup(hass, entry)
 
         hass.services.async_register.assert_not_called()
 
@@ -239,7 +300,7 @@ class TestAsyncSetupEntry:
         entry = _make_entry()
         mock_coord_cls.return_value = MagicMock(async_refresh=AsyncMock())
 
-        asyncio.run(async_setup_entry(hass, entry))
+        _run_setup(hass, entry)
 
         mock_coord_cls.assert_called_once()
         args, kwargs = mock_coord_cls.call_args
@@ -263,7 +324,7 @@ class TestAsyncUnloadEntry:
         entry = _make_entry()
         mock_coord_cls.return_value = MagicMock(async_refresh=AsyncMock())
 
-        asyncio.run(async_setup_entry(hass, entry))
+        _run_setup(hass, entry)
         assert entry.entry_id in hass.data[DOMAIN]
 
         result = asyncio.run(async_unload_entry(hass, entry))
@@ -279,7 +340,7 @@ class TestAsyncUnloadEntry:
         entry = _make_entry()
         mock_coord_cls.return_value = MagicMock(async_refresh=AsyncMock())
 
-        asyncio.run(async_setup_entry(hass, entry))
+        _run_setup(hass, entry)
         asyncio.run(async_unload_entry(hass, entry))
 
         mock_detach.assert_awaited_once_with(hass)
@@ -292,7 +353,7 @@ class TestAsyncUnloadEntry:
         entry = _make_entry()
         mock_coord_cls.return_value = MagicMock(async_refresh=AsyncMock())
 
-        asyncio.run(async_setup_entry(hass, entry))
+        _run_setup(hass, entry)
         asyncio.run(async_unload_entry(hass, entry))
 
         hass.services.async_remove.assert_called_once_with(DOMAIN, SERVICE_POLL)
@@ -306,9 +367,9 @@ class TestAsyncUnloadEntry:
         entry2 = _make_entry("entry2")
         mock_coord_cls.return_value = MagicMock(async_refresh=AsyncMock())
 
-        asyncio.run(async_setup_entry(hass, entry1))
+        _run_setup(hass, entry1)
         hass.services.has_service = MagicMock(return_value=True)
-        asyncio.run(async_setup_entry(hass, entry2))
+        _run_setup(hass, entry2)
 
         asyncio.run(async_unload_entry(hass, entry1))
 
@@ -325,7 +386,7 @@ class TestAsyncUnloadEntry:
         entry = _make_entry()
         mock_coord_cls.return_value = MagicMock(async_refresh=AsyncMock())
 
-        asyncio.run(async_setup_entry(hass, entry))
+        _run_setup(hass, entry)
         result = asyncio.run(async_unload_entry(hass, entry))
 
         assert result is False
