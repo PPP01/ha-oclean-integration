@@ -18,6 +18,7 @@ class OcleanDeviceData:
     battery: int | None = None
     last_brush_score: int | None = None
     last_brush_duration: int | None = None
+    last_brush_duration_scheduled: int | None = None
     last_brush_pressure: float | None = None
     last_brush_time: int | None = None
     brush_head_usage: int | None = None
@@ -57,6 +58,7 @@ class OcleanDeviceData:
             battery=data.get("battery"),
             last_brush_score=data.get("last_brush_score"),
             last_brush_duration=data.get("last_brush_duration"),
+            last_brush_duration_scheduled=data.get("last_brush_duration_scheduled"),
             last_brush_pressure=data.get("last_brush_pressure"),
             last_brush_time=data.get("last_brush_time"),
             brush_head_usage=data.get("brush_head_usage"),

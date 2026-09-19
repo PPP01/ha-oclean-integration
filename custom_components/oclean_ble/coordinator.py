@@ -59,6 +59,7 @@ from .const import (
     DATA_LAST_BRUSH_AREAS,
     DATA_LAST_BRUSH_COVERAGE,
     DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_DURATION_SCHEDULED,
     DATA_LAST_BRUSH_GESTURE_ARRAY,
     DATA_LAST_BRUSH_GESTURE_CODE,
     DATA_LAST_BRUSH_PNUM,
@@ -292,6 +293,7 @@ _PERSISTENT_KEYS = (
     DATA_BRUSH_HEAD_USAGE,
     DATA_LAST_BRUSH_SCORE,
     DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_DURATION_SCHEDULED,
     DATA_LAST_BRUSH_PRESSURE,
     DATA_LAST_BRUSH_TIME,
     DATA_LAST_BRUSH_AREAS,
@@ -318,6 +320,7 @@ _SESSION_SNAPSHOT_KEYS: tuple[str, ...] = (
     DATA_LAST_BRUSH_TIME,
     DATA_LAST_BRUSH_PNUM,
     DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_DURATION_SCHEDULED,
     DATA_LAST_BRUSH_SCORE,
     DATA_LAST_BRUSH_AREAS,
     DATA_LAST_BRUSH_COVERAGE,
@@ -482,6 +485,24 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
         try:
             raw = await self._poll_device()
             return OcleanDeviceData.from_dict(raw)
+        except asyncio.CancelledError as err:
+            # The ESPHome BLE-proxy connect path leaks a *spurious* CancelledError
+            # when a connection to a sleeping device times out (its internal
+            # disconnect-guard cancels an await). CancelledError is a
+            # BaseException, so the `except Exception` below never catches it and
+            # it would otherwise abort async_setup_entry ("config entry cancelled").
+            # A *genuine* task cancellation (HA shutdown / entry reload) sets
+            # current_task().cancelling() > 0 and MUST propagate – only translate
+            # the spurious proxy cancellation into a retryable UpdateFailed.
+            # Same decision as the write-action path (_run_ble_action).
+            task = asyncio.current_task()
+            if is_genuine_cancellation(task.cancelling() if task is not None else 0):
+                raise
+            self._log.debug("poll cancelled by BLE proxy (device likely asleep): %s", err)
+            self.last_poll_successful = False
+            if self._last_raw:
+                return OcleanDeviceData.from_dict(self._last_raw)
+            raise UpdateFailed(f"Oclean device not reachable (proxy cancelled): {err}") from err
         except Exception as err:
             # Catch all exceptions (BleakError, TimeoutError, IndexError from
             # habluetooth proxy backend, etc.) so HA can keep retrying rather
@@ -539,13 +560,9 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                 description,
                 err,
             )
-            raise BleakError(
-                f"device not reachable (proxy cancelled during {description})"
-            ) from err
+            raise BleakError(f"device not reachable (proxy cancelled during {description})") from err
         except TimeoutError as err:
-            raise BleakError(
-                f"{description} timed out after {BLE_ACTION_TOTAL_TIMEOUT}s"
-            ) from err
+            raise BleakError(f"{description} timed out after {BLE_ACTION_TOTAL_TIMEOUT}s") from err
 
     async def _connect_and_run(self, action: Callable[[BleakClient], Awaitable[None]]) -> None:
         """Connect, wait for the GATT table, run *action*, always disconnect."""

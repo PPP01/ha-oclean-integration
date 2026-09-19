@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **The `oclean_ble.log` file is now opt-in.** Previously the integration always wrote `<config>/oclean_ble.log`, which collected brushing session times, scores and the device MAC into the config directory — and therefore into every Home Assistant backup — even for users who never asked for diagnostics. The file handler is now attached only while debug logging is enabled for the integration (⋮ → **Enable debug logging**, or a `logger:` entry in `configuration.yaml` followed by a reload). With debug disabled, no file is created; warnings and errors still appear in the main HA log as before. See "Debug Logging" in the README.
+
+  **If you are reporting an issue and are asked for a log:** enable debug logging, reload the Oclean integration, reproduce the problem (e.g. brush), then attach `oclean_ble.log`.
+
+---
+
 ## [v1.3.7] – 2026-06-17
 
 ### Fixes

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import time as dtime
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -3022,3 +3023,152 @@ class TestWriteActionProtection:
 
         assert client.disconnect.await_count == 1
         assert coord.area_remind is None
+
+
+# ---------------------------------------------------------------------------
+# _async_update_data – spurious CancelledError from the BLE proxy (issue #116)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncUpdateDataCancelledError:
+    """CancelledError is a BaseException, so `except Exception` never caught it
+    and it propagated out of async_setup_entry ("config entry cancelled").
+    The ESPHome proxy leaks one when a sleeping device times out."""
+
+    @pytest.mark.asyncio
+    async def test_spurious_cancel_with_stale_data_returns_cached(self):
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._last_raw = {DATA_BATTERY: 80}
+        coord._poll_device = AsyncMock(side_effect=asyncio.CancelledError())
+
+        result = await coord._async_update_data()
+
+        assert result.battery == 80
+        assert coord.last_poll_successful is False
+
+    @pytest.mark.asyncio
+    async def test_spurious_cancel_without_stale_data_raises_update_failed(self):
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._last_raw = None
+        coord._poll_device = AsyncMock(side_effect=asyncio.CancelledError())
+
+        from homeassistant.helpers.update_coordinator import UpdateFailed
+
+        with pytest.raises(UpdateFailed):
+            await coord._async_update_data()
+
+    @pytest.mark.asyncio
+    async def test_spurious_cancel_does_not_escape_as_base_exception(self):
+        # The regression: a CancelledError escaping here aborts config entry
+        # setup. It must never leave _async_update_data uncaught.
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._last_raw = {DATA_BATTERY: 55}
+        coord._poll_device = AsyncMock(side_effect=asyncio.CancelledError())
+
+        try:
+            await coord._async_update_data()
+        except asyncio.CancelledError:  # pragma: no cover - fails the test
+            pytest.fail("spurious CancelledError escaped _async_update_data")
+
+    @pytest.mark.asyncio
+    async def test_genuine_cancellation_propagates(self):
+        # HA shutdown / entry reload cancels the task: cancelling() > 0, and
+        # cooperative cancellation must keep working.
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._last_raw = {DATA_BATTERY: 80}
+
+        started = asyncio.Event()
+
+        async def _hang():
+            started.set()
+            await asyncio.Event().wait()
+
+        coord._poll_device = AsyncMock(side_effect=_hang)
+
+        task = asyncio.create_task(coord._async_update_data())
+        await started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_genuine_cancellation_does_not_mark_poll_failed(self):
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._last_raw = {DATA_BATTERY: 80}
+        coord.last_poll_successful = True
+
+        started = asyncio.Event()
+
+        async def _hang():
+            started.set()
+            await asyncio.Event().wait()
+
+        coord._poll_device = AsyncMock(side_effect=_hang)
+
+        task = asyncio.create_task(coord._async_update_data())
+        await started.wait()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert coord.last_poll_successful is True
+
+
+# ---------------------------------------------------------------------------
+# _mean_metadata_kwargs – mean_type replaces has_mean (issue #124)
+# ---------------------------------------------------------------------------
+
+
+class TestMeanMetadataKwargs:
+    """HA 2025.8 replaced has_mean with mean_type; has_mean stops working in
+    HA 2026.11, so the metadata must carry mean_type on cores that have it."""
+
+    def test_uses_mean_type_when_available(self):
+        import sys
+        from enum import Enum
+        from types import ModuleType
+
+        from custom_components.oclean_ble.statistics import _mean_metadata_kwargs
+
+        class StatisticMeanType(Enum):
+            ARITHMETIC = "arithmetic"
+
+        module = ModuleType("homeassistant.components.recorder.models")
+        module.StatisticMeanType = StatisticMeanType
+        original = sys.modules.get("homeassistant.components.recorder.models")
+        sys.modules["homeassistant.components.recorder.models"] = module
+        try:
+            assert _mean_metadata_kwargs() == {"mean_type": StatisticMeanType.ARITHMETIC}
+        finally:
+            if original is None:
+                del sys.modules["homeassistant.components.recorder.models"]
+            else:
+                sys.modules["homeassistant.components.recorder.models"] = original
+
+    def test_falls_back_to_has_mean_on_older_cores(self):
+        import builtins
+
+        from custom_components.oclean_ble.statistics import _mean_metadata_kwargs
+
+        real_import = builtins.__import__
+
+        def _no_mean_type(name, *args, **kwargs):
+            if name == "homeassistant.components.recorder.models":
+                raise ImportError(name)
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", _no_mean_type):
+            assert _mean_metadata_kwargs() == {"has_mean": True}
+
+    def test_never_emits_both_keys(self):
+        # Passing both would be rejected by StatisticMetaData.
+        from custom_components.oclean_ble.statistics import _mean_metadata_kwargs
+
+        kwargs = _mean_metadata_kwargs()
+        assert ("mean_type" in kwargs) != ("has_mean" in kwargs)

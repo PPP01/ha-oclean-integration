@@ -6,6 +6,7 @@ import json
 import logging
 import logging.handlers
 import pathlib
+import queue
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
@@ -38,8 +39,10 @@ PLATFORMS: list[Platform] = [
     Platform.SWITCH,
 ]
 
-# Key under hass.data[DOMAIN] where the shared file handler is stored
+# Key under hass.data[DOMAIN] where the shared (queue) log handler is stored
 _FILE_HANDLER_KEY = "_file_handler"
+# Key for the QueueListener thread that owns the RotatingFileHandler
+_LOG_LISTENER_KEY = "_log_listener"
 
 
 def _build_file_handler(log_path: pathlib.Path) -> logging.handlers.RotatingFileHandler:
@@ -50,7 +53,11 @@ def _build_file_handler(log_path: pathlib.Path) -> logging.handlers.RotatingFile
         backupCount=2,  # keep oclean_ble.log + .1 + .2
         encoding="utf-8",
     )
-    handler.setLevel(logging.DEBUG)
+    # No handler-level filter: the integration logger's effective level (set
+    # via HA's `logger:` config or the UI debug toggle) decides what is
+    # written.  The handler is only attached at all when debug logging is
+    # enabled for this integration – see _attach_file_handler().
+    handler.setLevel(logging.NOTSET)
     handler.setFormatter(
         logging.Formatter(
             fmt="%(asctime)s  %(levelname)-8s  [%(name)s]  %(message)s",
@@ -65,7 +72,12 @@ async def _attach_file_handler(hass: HomeAssistant) -> None:
 
     Log file: <config_dir>/oclean_ble.log
     Max size:  1 MB, 2 rotated backups (≤ 3 MB total)
-    Level:     DEBUG – all unknown-byte traces and raw hex dumps included.
+
+    Opt-in: the file is only written while debug logging is enabled for this
+    integration (``logger:`` YAML config or the UI "enable debug logging"
+    toggle, followed by an integration reload).  Without debug enabled no file
+    handler is attached and no log file is created, so raw hex payloads and
+    session data never end up on disk (or in backups) by default.
 
     The handler is shared across multiple config entries (multiple devices).
     It is removed when the last entry is unloaded.
@@ -74,31 +86,59 @@ async def _attach_file_handler(hass: HomeAssistant) -> None:
     if _FILE_HANDLER_KEY in domain_data:
         return  # already attached (or attachment in progress)
 
+    oclean_logger = logging.getLogger("custom_components.oclean_ble")
+    if not oclean_logger.isEnabledFor(logging.DEBUG):
+        # Debug logging not enabled for this integration – skip the file log.
+        # Deliberately no sentinel here: a later reload with debug enabled
+        # must be able to attach the handler.
+        return
+
     # Set sentinel *before* the async gap so that a second config entry being
     # set up concurrently also sees the key and skips duplicate attachment.
     domain_data[_FILE_HANDLER_KEY] = None
 
     log_path = pathlib.Path(hass.config.config_dir) / "oclean_ble.log"
     # open() is blocking – run in the default executor to avoid loop warnings
-    handler = await hass.async_add_executor_job(_build_file_handler, log_path)
+    file_handler = await hass.async_add_executor_job(_build_file_handler, log_path)
 
-    oclean_logger = logging.getLogger("custom_components.oclean_ble")
-    oclean_logger.addHandler(handler)
-    domain_data[_FILE_HANDLER_KEY] = handler
+    # All file I/O happens on the listener thread, never on the event loop.
+    # The logger itself only gets a QueueHandler, whose emit() is a queue put.
+    # Without this, a log call made from the loop performs the write – and on
+    # rollover also a close()/open() pair – inline, which HA reports as a
+    # blocking call inside the event loop (issue #124).
+    log_queue: queue.SimpleQueue[logging.LogRecord] = queue.SimpleQueue()
+    listener = logging.handlers.QueueListener(log_queue, file_handler, respect_handler_level=True)
+    listener.start()
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+    queue_handler.setLevel(logging.NOTSET)
+
+    oclean_logger.addHandler(queue_handler)
+    domain_data[_FILE_HANDLER_KEY] = queue_handler
+    domain_data[_LOG_LISTENER_KEY] = listener
     _LOGGER.info("Oclean log file: %s", log_path)
 
 
 async def _detach_file_handler(hass: HomeAssistant) -> None:
-    """Remove the file handler when the last entry is unloaded."""
+    """Remove the log handler when the last entry is unloaded."""
     domain_data = hass.data.get(DOMAIN, {})
     handler = domain_data.pop(_FILE_HANDLER_KEY, None)
+    listener = domain_data.pop(_LOG_LISTENER_KEY, None)
     if handler is None:
         return
     oclean_logger = logging.getLogger("custom_components.oclean_ble")
     oclean_logger.removeHandler(handler)
-    # handler.close() flushes and closes the underlying file – run in executor
+    if listener is not None:
+        # stop() drains the queue and closes the file – both blocking.
+        await hass.async_add_executor_job(_stop_listener, listener)
     await hass.async_add_executor_job(handler.close)
     _LOGGER.debug("Oclean file log handler detached")
+
+
+def _stop_listener(listener: logging.handlers.QueueListener) -> None:
+    """Drain the queue, then close the file handlers it owns (blocking)."""
+    listener.stop()
+    for handler in listener.handlers:
+        handler.close()
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -172,10 +212,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=vol.Schema({vol.Optional("entry_id"): str}),
         )
 
-    # Initial poll: best-effort.  If the device is sleeping, entities stay
-    # unavailable and will update as soon as the next poll succeeds (either on
-    # the configured interval or via a manual service call).
-    await coordinator.async_refresh()
+    # Initial poll: best-effort and NON-BLOCKING.  Awaiting async_refresh() here
+    # would stall HA startup by up to BLE_POLL_TOTAL_TIMEOUT + several connect
+    # attempts while the BLE stack waits for a possibly-sleeping toothbrush,
+    # triggering HA's "still starting / not everything available" warning.
+    # Run it as a background task tied to the entry lifecycle instead so setup
+    # returns immediately; entities stay unavailable until the poll succeeds
+    # (on the configured interval or via a manual service call).  The task is
+    # cancelled automatically on unload.
+    entry.async_create_background_task(
+        hass,
+        coordinator.async_refresh(),
+        name=f"{DOMAIN}_initial_refresh_{entry.entry_id}",
+    )
 
     return True
 

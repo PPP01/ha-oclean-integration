@@ -424,12 +424,13 @@ class TestSensorStateMapping:
         assert sensor.native_value == 88
 
     def test_duration_sensor_native_value(self):
-        from custom_components.oclean_ble.sensor import SENSOR_DESCRIPTIONS, OcleanSensor
+        # Duration is no longer description-driven: OcleanDurationSensor owns
+        # it so it can expose the scheduled programme length as an attribute.
+        from custom_components.oclean_ble.sensor import OcleanDurationSensor
 
         data = OcleanDeviceData(last_brush_duration=150)
         coord = self._make_sensor_coordinator(data)
-        desc = next(d for d in SENSOR_DESCRIPTIONS if d.key == DATA_LAST_BRUSH_DURATION)
-        sensor = OcleanSensor(coord, desc, "AA:BB:CC:DD:EE:FF", "Oclean")
+        sensor = OcleanDurationSensor(coord, "AA:BB:CC:DD:EE:FF", "Oclean")
 
         assert sensor.native_value == 150
 
