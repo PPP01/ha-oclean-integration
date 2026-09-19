@@ -491,8 +491,9 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
             # A *genuine* task cancellation (HA shutdown / entry reload) sets
             # current_task().cancelling() > 0 and MUST propagate – only translate
             # the spurious proxy cancellation into a retryable UpdateFailed.
+            # Same decision as the write-action path (_run_ble_action).
             task = asyncio.current_task()
-            if task is not None and task.cancelling():
+            if is_genuine_cancellation(task.cancelling() if task is not None else 0):
                 raise
             self._log.debug("poll cancelled by BLE proxy (device likely asleep): %s", err)
             self.last_poll_successful = False
@@ -556,13 +557,9 @@ class OcleanCoordinator(DataUpdateCoordinator[OcleanDeviceData]):
                 description,
                 err,
             )
-            raise BleakError(
-                f"device not reachable (proxy cancelled during {description})"
-            ) from err
+            raise BleakError(f"device not reachable (proxy cancelled during {description})") from err
         except TimeoutError as err:
-            raise BleakError(
-                f"{description} timed out after {BLE_ACTION_TOTAL_TIMEOUT}s"
-            ) from err
+            raise BleakError(f"{description} timed out after {BLE_ACTION_TOTAL_TIMEOUT}s") from err
 
     async def _connect_and_run(self, action: Callable[[BleakClient], Awaitable[None]]) -> None:
         """Connect, wait for the GATT table, run *action*, always disconnect."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import time as dtime
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -3022,3 +3023,98 @@ class TestWriteActionProtection:
 
         assert client.disconnect.await_count == 1
         assert coord.area_remind is None
+
+
+# ---------------------------------------------------------------------------
+# _async_update_data – spurious CancelledError from the BLE proxy (issue #116)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncUpdateDataCancelledError:
+    """CancelledError is a BaseException, so `except Exception` never caught it
+    and it propagated out of async_setup_entry ("config entry cancelled").
+    The ESPHome proxy leaks one when a sleeping device times out."""
+
+    @pytest.mark.asyncio
+    async def test_spurious_cancel_with_stale_data_returns_cached(self):
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._last_raw = {DATA_BATTERY: 80}
+        coord._poll_device = AsyncMock(side_effect=asyncio.CancelledError())
+
+        result = await coord._async_update_data()
+
+        assert result.battery == 80
+        assert coord.last_poll_successful is False
+
+    @pytest.mark.asyncio
+    async def test_spurious_cancel_without_stale_data_raises_update_failed(self):
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._last_raw = None
+        coord._poll_device = AsyncMock(side_effect=asyncio.CancelledError())
+
+        from homeassistant.helpers.update_coordinator import UpdateFailed
+
+        with pytest.raises(UpdateFailed):
+            await coord._async_update_data()
+
+    @pytest.mark.asyncio
+    async def test_spurious_cancel_does_not_escape_as_base_exception(self):
+        # The regression: a CancelledError escaping here aborts config entry
+        # setup. It must never leave _async_update_data uncaught.
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._last_raw = {DATA_BATTERY: 55}
+        coord._poll_device = AsyncMock(side_effect=asyncio.CancelledError())
+
+        try:
+            await coord._async_update_data()
+        except asyncio.CancelledError:  # pragma: no cover - fails the test
+            pytest.fail("spurious CancelledError escaped _async_update_data")
+
+    @pytest.mark.asyncio
+    async def test_genuine_cancellation_propagates(self):
+        # HA shutdown / entry reload cancels the task: cancelling() > 0, and
+        # cooperative cancellation must keep working.
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._last_raw = {DATA_BATTERY: 80}
+
+        started = asyncio.Event()
+
+        async def _hang():
+            started.set()
+            await asyncio.Event().wait()
+
+        coord._poll_device = AsyncMock(side_effect=_hang)
+
+        task = asyncio.create_task(coord._async_update_data())
+        await started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_genuine_cancellation_does_not_mark_poll_failed(self):
+        coord = _make_coordinator()
+        coord._store_loaded = True
+        coord._last_raw = {DATA_BATTERY: 80}
+        coord.last_poll_successful = True
+
+        started = asyncio.Event()
+
+        async def _hang():
+            started.set()
+            await asyncio.Event().wait()
+
+        coord._poll_device = AsyncMock(side_effect=_hang)
+
+        task = asyncio.create_task(coord._async_update_data())
+        await started.wait()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert coord.last_poll_successful is True
